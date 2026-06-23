@@ -1,0 +1,3172 @@
+classdef sourceLocalizerModified < handle
+
+    properties
+
+        subj
+
+        chanNames
+        Fs
+
+        electrodeLocalizer
+
+        braindata = struct('myBd',[],'myBp',[]);
+
+        spikeDetectionResults = struct('rasters',[],'waveforms',[],'paramStruct',struct())
+        seqResults = struct('seriesAll',[],'timesAll',[],'startEndTime',[]);
+        sensors
+
+        sourceLocalizationResults = struct('localizationResults',[],'roiResults',[],'paramStruct',struct());
+
+        deltaPosition
+
+        timeSeries
+
+        rawTimeSeries   % z-scored but unfiltered copy, stashed before findSpikeTimes modifies timeSeries
+
+        bpEnvelope        % cached decimated 0.5-30 Hz RMS envelope for plotting (single, [decSamp x nChan])
+        bpEnvelopeParams  % struct: dispDec, envWinSec, Fs used to build bpEnvelope (for cache invalidation)
+
+    end
+
+    properties (Hidden = true, Transient = true)
+
+        subjFolder
+
+    end
+
+    properties (Transient = true)
+
+        geodesic
+
+    end
+
+    properties (Hidden = true)
+        rootFolder
+    end
+
+    methods
+
+        %% Setup functions 
+
+        function self = sourceLocalizerModified(subj, rootFolder, varargin)
+
+            % Inputs:
+            %   subj       - Subject name, e.g. 'NIH032'
+            %   rootFolder - Path to root data folder.
+            %       Expected folder structure:
+            %           rootFolder/
+            %               <subj>/
+            %                   tal/
+            %
+            % Optional name-value:
+            %   forceNewElectrodeLocalizer - If true, re-run electrode
+            %       localization even if tal/leads.csv already exists.
+            %       Default: false.
+            %
+            % Note:
+            %   Channel names are prompted during the electrode localization
+            %   create pipeline (just before the naming GUI). They can also
+            %   be assigned directly (sl.chanNames) or loaded automatically
+            %   from a time series file via sl.loadTimeSeries().
+            %
+            %   timeSeries and Fs are NOT constructor arguments. Either
+            %   assign them directly after construction:
+            %       sl.timeSeries = myData;   % [samples x channels]
+            %       sl.Fs         = 1000;     % Hz
+            %   or load from a file via dialog (.mat, .edf, .fif):
+            %       sl.loadTimeSeries()
+            %   Then call sl.localizationManager().
+
+            p = inputParser;
+            addParameter(p, 'chanNames',                  {});
+            addParameter(p, 'forceNewElectrodeLocalizer', false);
+            parse(p, varargin{:});
+            forceNewElectrodeLocalizer = p.Results.forceNewElectrodeLocalizer;
+            chanNames                  = p.Results.chanNames;
+
+            toolboxRoot = fileparts(mfilename('fullpath'));
+            addpath(genpath(toolboxRoot));
+
+            self.subj       = subj;
+            self.rootFolder = rootFolder;
+            self.chanNames  = chanNames;
+
+            %% Electrode localization
+
+            self.electrodeLocalizer = electrodeLocalizer( ...
+                subj, rootFolder, 'chanNames', chanNames, 'forceNew', forceNewElectrodeLocalizer);
+
+            % Propagate channel names resolved during electrode localization
+            if ~isempty(self.electrodeLocalizer.chanNames)
+                self.chanNames = self.electrodeLocalizer.chanNames;
+            end
+
+            %% Pull braindata
+            
+            self.retrieveBraindata;
+
+        end
+
+        %% Time series loading
+
+        function loadTimeSeries(self)
+            % Load a time series file via dialog and assign self.timeSeries,
+            % self.Fs, and (when appropriate) self.chanNames.
+            %
+            % Supported formats:
+            %   .mat — expects a 2-D numeric matrix [samples x channels] and
+            %          a scalar Fs variable (searches for Fs/fs/srate/etc.).
+            %          Falls back to an input dialog for Fs if not found.
+            %   .edf — requires MATLAB R2023a+ Signal Processing Toolbox
+            %          (edfread). Errors helpfully if unavailable.
+            %   .fif — requires FieldTrip (ft_read_header / ft_read_data)
+            %          on the MATLAB path. Errors helpfully if unavailable.
+            %
+            % Channel name resolution (chanNamesFromFile = names in the file):
+            %   chanNames empty,  file has names   → set silently.
+            %   chanNames set,    count matches     → leave existing.
+            %   chanNames set,    count mismatch    → warn and overwrite
+            %                                         (file header is
+            %                                         authoritative for its
+            %                                         own data).
+            %   chanNames empty,  file has no names → error (ambiguous).
+            %   chanNames set,    file has no names,
+            %     count mismatch                    → error.
+            %
+            % Dismiss the dialog to abort without changes.
+
+            [ts, Fs, chanNamesFromFile] = sourceLocalizerModified.loadTimeSeriesFromFile(self.chanNames);
+
+            if isempty(ts)
+                fprintf('[sourceLocalizerModified] No time series loaded.\n');
+                return;
+            end
+
+            nCh = size(ts, 2);
+
+            if ~isempty(chanNamesFromFile)
+                if isempty(self.chanNames)
+                    self.chanNames = chanNamesFromFile;
+                elseif length(self.chanNames) ~= nCh
+                    % Pre-set chanNames (e.g. from leads.csv) are the target set.
+                    % Try to find each one in the file's channel list and subset ts.
+                    [mask, idx] = ismember(strtrim(self.chanNames), strtrim(chanNamesFromFile));
+                    if any(mask)
+                        missing = self.chanNames(~mask);
+                        if ~isempty(missing)
+                            warning('[sourceLocalizerModified] %d channel(s) not found in EDF and will be missing: %s', ...
+                                sum(~mask), strjoin(missing, ', '));
+                        end
+                        ts = ts(:, idx(mask));
+                        self.chanNames = self.chanNames(mask);
+                        nCh = size(ts, 2);
+                        fprintf('[sourceLocalizerModified] Subsetted EDF to %d named channels.\n', nCh);
+                    else
+                        warning('[sourceLocalizerModified] chanNames (%d) does not match time series channels (%d) and no name overlap found. Overwriting with names from file.', ...
+                            length(self.chanNames), nCh);
+                        self.chanNames = chanNamesFromFile;
+                    end
+                end
+                % else: existing chanNames match → leave alone
+            else
+                % File has no channel labels — prompt if we don't have them yet.
+                if isempty(self.chanNames)
+                    self.chanNames = sourceLocalizerModified.loadChanNamesFromFile();
+                end
+                if isempty(self.chanNames)
+                    error('[sourceLocalizerModified] Channel names are required. Provide a channel names file or set sl.chanNames directly.');
+                elseif length(self.chanNames) ~= nCh
+                    error('[sourceLocalizerModified] chanNames has %d entries but time series has %d channels.', ...
+                        length(self.chanNames), nCh);
+                end
+                % else: existing chanNames match → fine
+            end
+
+            self.timeSeries = ts;
+            self.Fs         = Fs;
+            fprintf('[sourceLocalizerModified] Loaded %d samples x %d channels at %.1f Hz.\n', ...
+                size(ts,1), nCh, Fs);
+        end
+
+        function disposeOfBadSegment(self)
+
+            subjDir = fullfile(self.electrodeLocalizer.rootFolder,self.electrodeLocalizer.subj,sprintf('%s.mat','badData'));
+            load(subjDir,'badData'); % In minutes
+
+            for ii = 1:size(badData.badInterval,1)
+                thisBadInterval = badData.badInterval(ii,:); 
+                thisBadInterval = [thisBadInterval(1) * 60 * self.Fs thisBadInterval(2) * 60 * self.Fs];
+                thisBadInterval(1) = max(1,thisBadInterval(1)); 
+                thisBadInterval(2) = min(size(self.timeSeries,1),thisBadInterval(2)); 
+                
+                thisBadInterval = thisBadInterval(1) : thisBadInterval(2); 
+
+                self.timeSeries(thisBadInterval,:) = nan; 
+            end
+
+
+
+
+        end
+
+
+
+        %% Property setters
+
+        function set.timeSeries(self, val)
+            if ~isempty(self.chanNames) && ~isempty(val)
+                assert(size(val, 2) == length(self.chanNames), ...
+                    ['timeSeries must have %d columns (one per channel ' ...
+                     'in chanNames), got %d.'], ...
+                    length(self.chanNames), size(val, 2));
+            end
+            self.timeSeries = val;
+        end
+
+        function set.Fs(self, val)
+            if ~isempty(val)
+                assert(isnumeric(val) && isscalar(val) && val > 0, ...
+                    'Fs must be a positive scalar.');
+            end
+            self.Fs = val;
+        end
+
+        function subjFolder = get.subjFolder(self)
+
+            subjFolder = fullfile(self.rootFolder,self.subj);
+
+        end
+
+
+        function [myBd,myBp] = retrieveBraindata(self,varargin)
+
+            %% Preamble
+
+            p = inputParser;
+            addParameter(p,'forceNew',false);
+            addParameter(p,'saving',true);
+            parse(p,varargin{:})
+            forceNew = p.Results.forceNew;
+            saving = p.Results.saving;
+
+            if ~forceNew && ~isempty(self.braindata.myBd)
+                myBd = self.braindata.myBd; 
+                myBp = self.braindata.myBp; 
+                return; 
+            end
+
+            %%
+
+            assert(exist('braindata2', 'file') == 2, 'braindata2 not found on path. Please check paths. Navigate to diamondToolbox and use addpath(genpath(pwd)).');
+            assert(exist('brainplotter', 'file') == 2, 'brainplotter not found on path. Please check paths. Navigate to diamondToolbox and use addpath(genpath(pwd)).');
+
+            subjDir = fullfile(self.subjFolder);
+
+            fName = fullfile(subjDir,sprintf('brainData_%s.mat',self.subj));
+
+            if exist(fName','file') == 2 && ~forceNew
+                S = load(fName,'myBd','myBp');
+                myBp = S.myBp;
+                myBd = S.myBd;
+            else
+
+                fprintf('Creating braindata objects for %s.\n',self.subj);
+
+                myBd = braindata2(self.subj,self.rootFolder);
+                myBp = ez_get_plotter(myBd);
+
+                if saving; save(fName,'myBd','myBp'); end
+
+            end
+
+            self.braindata.myBp = myBp;
+            self.braindata.myBd = myBd;
+
+        end
+
+        %% Principal localization pipeline and helpers 
+
+        function localizationManager(self,varargin)
+
+            assert(~isempty(self.timeSeries), ...
+                ['timeSeries must be set before running localizationManager. ' ...
+                 'Assign it as: sl.timeSeries = yourData;']);
+            assert(~isempty(self.Fs), ...
+                ['Fs must be set before running localizationManager. ' ...
+                 'Assign it as: sl.Fs = yourFs;']);
+
+            p = inputParser;
+            addParameter(p,'plotting',true);
+            addParameter(p,'forceNew',false);
+            addParameter(p,'timeWindow',0); % Seconds
+            addParameter(p,'detectionMode','auto');
+            addParameter(p,'requireDepression',false);
+            addParameter(p,'depressionPreWinMin',5);
+            addParameter(p,'depressionPostWinMin',5);
+            addParameter(p,'depressionSigma',1);
+            addParameter(p,'depressionMinDurSec',120);
+            parse(p,varargin{:})
+            plotting             = p.Results.plotting;
+            forceNew             = p.Results.forceNew;
+            timeWindow           = p.Results.timeWindow;
+            detectionMode        = p.Results.detectionMode;
+            requireDepression    = p.Results.requireDepression;
+            depressionPreWinMin  = p.Results.depressionPreWinMin;
+            depressionPostWinMin = p.Results.depressionPostWinMin;
+            depressionSigma      = p.Results.depressionSigma;
+            depressionMinDurSec  = p.Results.depressionMinDurSec;
+
+            self.prepareDeltaPosition('forceNew',forceNew,'detectionMode',detectionMode, ...
+                'requireDepression',requireDepression, ...
+                'depressionPreWinMin',depressionPreWinMin, ...
+                'depressionPostWinMin',depressionPostWinMin, ...
+                'depressionSigma',depressionSigma, ...
+                'depressionMinDurSec',depressionMinDurSec);
+
+            %% Onto localization
+
+            self.localizationFunction('forceNew',forceNew); % Spikes or seizure agnostic call
+            self.locDataToRoi('forceNew', forceNew, 'timeWindow', timeWindow);
+
+            %% Plot
+
+            if ~plotting; return; end
+            self.plotSurfFun;
+
+            % self.plotDimensionsReducedWrapper; 
+
+        end
+
+        function prepareDeltaPosition(self,varargin)
+
+            p = inputParser;
+            addParameter(p,'forceNew',false);
+            addParameter(p,'detectionMode','auto'); 
+            addParameter(p,'requireDepression',false);
+            addParameter(p,'depressionPreWinMin',5);    % pre-SD baseline window (min)
+            addParameter(p,'depressionPostWinMin',5);   % post-SD test window (min)
+            addParameter(p,'depressionSigma',1);        % threshold in SDs below baseline
+            addParameter(p,'depressionMinDurSec',120);  % min continuous depression (s)
+            parse(p,varargin{:})
+            forceNew             = p.Results.forceNew;
+            detectionMode        = p.Results.detectionMode;
+            requireDepression    = p.Results.requireDepression;
+            depressionPreWinMin  = p.Results.depressionPreWinMin;
+            depressionPostWinMin = p.Results.depressionPostWinMin;
+            depressionSigma      = p.Results.depressionSigma;
+            depressionMinDurSec  = p.Results.depressionMinDurSec;
+
+            if ~forceNew && ~isempty(self.deltaPosition); return; end
+
+            % Define parameters
+            self.sourceLocalizationResults.paramStruct = struct(...
+                'propagationSpeed',.05,... % mm / s
+                'sensorDistance',100,... mm
+                'subsensorLength',3,...
+                'distanceThresh', 150); % mm
+
+            switch detectionMode 
+                case 'auto'
+
+                    self.populateSpikes('forceNew',forceNew);
+                    self.computeSequences('forceNew',forceNew);
+
+                    % Depression qualifier: only available in auto mode,
+                    % where rawTimeSeries is stashed from the raw signal.
+                    % Applied after sequence detection but before geometry
+                    % conversion, so deltaPosition only reflects SDs that
+                    % passed the criterion.
+                    if requireDepression
+                        self.filterSeqByDepression(depressionPreWinMin, depressionPostWinMin, ...
+                            depressionSigma, depressionMinDurSec);
+                    end
+
+                case 'annotations'
+
+                    [s, clipDetails] = spreadsheetToSDTimes(self.rootFolder,self.subj,'chanNames',self.chanNames);
+                    populateSeqFromAnnotations_laura(self,s,clipDetails);; %changed to add _laura
+            end
+
+            self.getSensors; % Should be lightweight; always re-compute 
+            self.spikeSequenceToDeltaPosition; %  Should be lightweight; always re-compute 
+
+        end
+
+
+        %% Ancillary functions, for IED localization 
+
+        function populateSpikes(self,varargin)
+
+            p = inputParser;
+            addParameter(p,'forceNew',false);
+            parse(p,varargin{:})
+            forceNew = p.Results.forceNew;
+
+            if ~isempty(self.spikeDetectionResults.rasters) && ~forceNew; return; end
+
+            assert(~isempty(self.timeSeries),'Time series empty.'); 
+
+            self.timeSeries = zScore_omitNan(self.timeSeries);
+            fprintf('Z-scoring time series. \n'); 
+
+            %% Define parameters
+
+            self.spikeDetectionResults.paramStruct = struct(...
+                'seqWin',10 * 60,... 10 minutes, in seconds
+                'maxNegPeakWidth',10 * 60,... % 10 minutes, in seconds
+                'peakWin',10 * 60,... % 10 minutes, in seconds 
+                'zThresh',1,... % Sigma - changed from 1
+                'ampScale',1); % Sigma  
+
+            fprintf('Calling spike detector with the following parameters. These are adjustable.\n');
+            disp(self.spikeDetectionResults.paramStruct);
+
+            self.rawTimeSeries = self.timeSeries;   % stash z-scored raw before filtering modifies it
+            self.findSpikeTimes;
+
+        end
+
+        function findSpikeTimes(self)
+
+            %% parse inputs
+            % p = inputParser;
+
+            % specific to this code
+            % defAmpScale = 3;
+            % addParameter(p,'ampScale',defAmpScale,@(x) isscalar(x));
+
+            % For passing in time series.
+            % addParameter(p,'maxNegPeakWidth',50);
+            % addParameter(p,'maxPosPeakWidth',Inf);
+            % addParameter(p,'peakSeparation',0);
+            % addParameter(p,'trackPeaks',false);
+            % addParameter(p,'maxPeakHeight',Inf);
+            %
+            % parse(p,varargin{:})
+            % ampScale = p.Results.ampScale;
+            %
+            % maxNegPeakWidth = p.Results.maxNegPeakWidth;
+            % maxPosPeakWidth = p.Results.maxPosPeakWidth;
+            % trackPeaks = p.Results.trackPeaks;
+            % peakSeparation = p.Results.peakSeparation;
+            % maxPeakHeight = p.Results.maxPeakHeight;
+
+            % Kill the input parser
+
+            % Detect artifact windows on the (still raw / unfiltered) time
+            % series and zero them out in place. Filtering / detrending may
+            % follow this step and before peak detection — the zero pads
+            % survive filtering, so flagged samples remain effectively dead
+            % at peak-detection time without needing a second mask pass.
+            
+            self.filterTs(0.1); 
+            self.zeroArtifactWindows();
+
+            self.filterTs(0.01); 
+            self.detrendTs; 
+
+            maxNegPeakWidth = self.spikeDetectionResults.paramStruct.maxNegPeakWidth * self.Fs; % Samples
+            peakWin = self.spikeDetectionResults.paramStruct.peakWin * self.Fs; % Samples
+            zThresh = self.spikeDetectionResults.paramStruct.zThresh; 
+            ampScale = self.spikeDetectionResults.paramStruct.ampScale; 
+
+            ctsThresh = 0;
+            zThreshPeak = .25;
+            minNegPeakWidth = 1 * 60 * self.Fs; % Start with minutes; convert to samples
+
+            % If you choose to mess around with ctsThresh or other
+            % 'non-reported' parameters, feel free to pass them back with
+            % self.spikeDetectionResults.paramStruct.
+
+            % negPeakSeparation = 5 * 60 * self.Fs; % Samples
+            negPeakSeparation = self.spikeDetectionResults.paramStruct.seqWin * self.Fs; % Samples
+            % I think this is the same paradigm I used in the spikes. 
+            % negPeakSeparation should be equal to (or I guess greater
+            % than) seqWin. The rationale is that we don't want the same
+            % electrode registering multiple times in the same sequence.
+            % Such information can't be processed by our algorithm. 
+
+            % So by establishing seqWin we're effectively committing to
+            % disposing of double spikes captured in this window. 
+
+            % There's discussion in computeSequences that may be
+            % applicable.
+
+            %% load data and set up parameters/arrays
+
+            thisTs = self.timeSeries;
+            tsDims = size(thisTs);
+
+            %% Find peaks
+
+            fullRaster = sparse(tsDims(1),tsDims(2));
+            waveformsMaster = cell(1,tsDims(2));
+
+            for(kk=1:length(self.chanNames))
+
+                warning('off','signal:findpeaks:largeMinPeakHeight');
+                % Once for each worker 
+
+                currentRaster = sparse(tsDims(1),1);
+                waveforms = cell(size(currentRaster));
+
+                %% Peaks and troughs
+
+                xCurrent = thisTs(:,kk);
+                % [pHeight,pInd] = findpeaks(xCurrent,'MinPeakProminence',zThreshPeak); 
+                [~,pInd,~,pHeight] = findpeaks(xCurrent,'MinPeakHeight',zThreshPeak);
+                % Using prominence...
+
+                % isBad = pHeight > maxPeakHeight;
+                % pHeight(isBad) = [];
+                % pInd(isBad) = [];
+
+                [nHeight,nInd]=findpeaks(-xCurrent,'MinPeakHeight',zThresh,'MaxPeakWidth',maxNegPeakWidth,'MinPeakWidth',minNegPeakWidth,'MinPeakDistance',negPeakSeparation);
+
+                isBad = false(size(nHeight));
+                nHeight(isBad) = [];
+                nInd(isBad) = [];
+
+
+                %% Matching
+
+                maxNumel = 1000000;
+                bufferSize = min(100, ceil(maxNumel / length(pInd)));
+
+                nIndBuffer = buffer(nInd,bufferSize);
+                Nh2Buffer = buffer(nHeight,bufferSize);
+
+                Nh2Buffer(nIndBuffer == 0) = NaN;
+                nIndBuffer(nIndBuffer == 0) = NaN;
+
+                for ii = 1:size(nIndBuffer,2)
+
+                    matchingMatrix = pInd - nIndBuffer(:,ii)';
+
+                    % inds = matchingMatrix >= -peakWin & matchingMatrix < 0;
+                    % The above -- for up-deflection to come before down-deflection.
+                    inds = matchingMatrix >= -peakWin & matchingMatrix <= peakWin;
+
+                    [pFind,nFind] = find(inds);
+
+                    heightMatrix = false(size(pFind));
+                    for jj = 1:length(pFind)
+                        heightMatrix(jj) = pHeight(pFind(jj)) + Nh2Buffer(nFind(jj),ii) >= ampScale * zThresh;
+                    end
+
+                    nFind = nFind(heightMatrix);
+                    % pFind = pFind(heightMatrix);
+
+                    for jj = 1:length(nFind)
+
+                        ts = nan(1,2 * peakWin + 1);
+                        % I'll start by filling this with NaNs, for the rare event that
+                        % we have spikes at the very beginning of the time series.
+                        % tsBb = ts;
+
+                        startInd = max(nIndBuffer(nFind(jj),ii) - peakWin,1);
+                        startBuffer = max(-(nIndBuffer(nFind(jj),ii) - peakWin) + 2,1);
+
+                        endInd = min(nIndBuffer(nFind(jj),ii) + peakWin,tsDims(1));
+                        endBuffer = min(peakWin-(nIndBuffer(nFind(jj),ii)-tsDims(1)) + 1,2 * peakWin + 1);
+                        ts(startBuffer:endBuffer) = xCurrent(startInd:endInd);
+
+                        % clf; plot(nIndBuffer(nFind(jj),ii)- hp:nIndBuffer(nFind(jj),ii) + hp,ts); hold on
+                        % plot(nIndBuffer(nFind(jj),ii),xCurrent(nIndBuffer(nFind(jj),ii)),'ro')
+                        % plot(pInd(pFind(jj)),xCurrent(pInd(pFind(jj))),'bo');
+                        % pause
+
+                        waveforms{nIndBuffer(nFind(jj),ii)} = ts;
+                    end
+
+                    currentRaster(nIndBuffer(nFind,ii)) = true;
+
+
+                end
+                waveforms(~currentRaster) = [];
+                waveforms = cell2mat(waveforms);
+                waveformsMaster{kk} = waveforms;
+
+                fullRaster(:,kk) = currentRaster;
+
+
+            end
+
+            badCounts = sum(fullRaster) < ctsThresh;
+            fullRaster(:,badCounts) = false;
+
+
+            %% Pack up
+
+            self.spikeDetectionResults.rasters = fullRaster;
+            self.spikeDetectionResults.Fs = self.Fs; % Downsampled
+            self.spikeDetectionResults.waveforms = waveformsMaster;
+
+            self.spikeDetectionResults.paramStruct.ctsThresh = ctsThresh; 
+            self.spikeDetectionResults.paramStruct.zThreshPeak = zThreshPeak;
+            self.spikeDetectionResults.paramStruct.minNegPeakWidth = minNegPeakWidth; % 2 minute, in samples
+
+
+        end
+
+        function computeSequences(self,varargin)
+
+            % Formerly computeSequences_includeDuplicate
+
+            %% Preamble
+
+            p = inputParser;
+            addParameter(p,'seriesLength',3);
+            addParameter(p,'forceNew',false);
+            parse(p,varargin{:})
+            seriesLength = p.Results.seriesLength;
+            forceNew = p.Results.forceNew;
+
+            if ~forceNew && ~isempty(self.seqResults.seriesAll); return; end
+
+            % seqWin = 0.1;
+            % I never really gave the above much thought.
+            % But 0.1 is a pretty good number here.
+            % We wouldn't really be expecting to localize spikes with sensors greater
+            % than 0.3 cm apart, because we wouldn't expect signal to necessarily
+            % travel that far anyway.
+            % So given a sensor spacing of 3 cm, the maximal interval of time receipt
+            % is distance (mm) / propagationSpeed (mm/s)
+            % = 30 / 300 mm / mm * s
+            % = 0.1 s.
+
+            seqWinSamples = ceil(self.spikeDetectionResults.paramStruct.seqWin * self.Fs);  % Samples
+            % overlapSamples = floor(seqWinSamples / 2);
+            overlapSamples = floor(seqWinSamples * (3/4));
+
+            rasters = self.spikeDetectionResults.rasters;
+
+            if isempty(rasters)
+                self.seqResults = struct('seriesAll',[],'timesAll',[]);
+                return; 
+            end % Bad session
+
+            totalWindows = buffer(1:size(rasters,1),seqWinSamples,overlapSamples,'nodelay');
+
+            %% On to the function
+
+            [winSpkCnt,~]=buffer(full(sum(rasters,2)),seqWinSamples,overlapSamples,'nodelay');
+            winSpkCnt=sum(winSpkCnt);
+            hasSeries = find(winSpkCnt >= seriesLength);
+
+            % If nothing
+
+            seriesAll = cell(max(winSpkCnt),length(hasSeries));
+            seriesAll(:) = {''};
+            timesAll = nan(max(winSpkCnt),length(hasSeries));
+
+            startEndTime = nan(2,length(hasSeries));
+
+            if isempty(hasSeries); return; end
+
+            % For parallel
+            timesHolder = nan(max(winSpkCnt),1);
+            leadsHolder = cell(max(winSpkCnt),1);
+            leadsHolder(:) = {''};
+
+            for jj = 1:length(hasSeries)
+                currentWindow = rasters(totalWindows(:,hasSeries(jj)),:);
+                [row,col] = find(currentWindow); % row times, col leads
+                % currentTimes = totalWindows(row,hasSeries(jj));
+                % currentLeads = chanNames(col);
+
+                % Here we can deal with handling of duplicates.
+                % That is, an instance when a single electrode has multiple IEDs in a
+                % single window.
+                % We can use a method more delicate than that used in computeSequences.
+                % Essentially under our fundamental assumptions, it doesn't make sense
+                % to have duplicates. We assume single impulses are sent from the
+                % source. For there to be a duplicate, you would need consecutive
+                % barrages with low latency (unlikely) or for the signal to change
+                % direction and double back (impossible).
+                % The alternative is that there's a single discharge but with a complex
+                % waveform, which registers as multiple spikes. The hope is that seqWin
+                % is SHORT enough that these end up being called their own sequence.
+
+                % There is a balance where if seqWin is too short, then we'll miss
+                % sequences (particularly ones where the wave may travel slowly) which
+                % take a long time to traverse the array.
+                % But if it's too long, we actually lose VERY LITTLE, if waveforms are
+                % simple. If waveforms are complex, we're more likely to incorporate a
+                % double spike in the same sequence, where we would have done better to
+                % call that a separate sequence.
+
+                % It is possible there are some "double spikes" which are impossible to
+                % resolve, if the latency between the two spikes is less than the time
+                % it takes for the wave to cross the array. There's not much we can do
+                % about this (although there's filtering).
+                % Alternatively, sometimes what might register as a "double spike" is
+                % actually noise and we don't want that. In other words we'd rather
+                % that the noise didn't exist and the double spike were registered as a
+                % single.
+
+                % Generally, we care more about making sure the entire sequence is
+                % recovered than we do about separating double spikes, so our seqWin
+                % will err towards the long side.
+
+                % Regarding double spikes that we do capture, they may be 1) noise, or
+                % 2) indicative of a complex waveform. Regardless, we can't afford to
+                % make our seqWin shorter, and even for the shortest seqWin, some
+                % double spikes will register.
+
+                % Therefore we'll assume these double spikes are noise, and address
+                % them by taking the median time.
+
+                % I believe it won't work to take a true median (with rounding). The
+                % reason is that the spike times act as a "key" to recover the
+                % waveforms in waveformsFromSequence. I get that this system is clumsy
+                % and possibly merits revision, but it's what we have now.
+                % By virtue of that, let's take a "median" which nonetheless mandates
+                % that we pick an element.
+                % In fact maybe taking a value, that is, that "closest" to the median,
+                % is best, in the event that it's not actually noise.
+                % The below method picks arbitrarily (not randomely) which is good. In
+                % cases of even ties, it should pick the FIRST before the median.
+
+                [a,b,c] = unique(col);
+                if length(a) < seriesLength; continue; end
+                currentLeads = self.chanNames(a);
+                currentTimes = nan(size(a));
+                for ii = 1:length(a)
+                    % currentTimes(ii) = median(totalWindows(row(c==ii),hasSeries(jj)));
+
+                    % Force to choose a value
+                    vals = totalWindows(row(c==ii),hasSeries(jj));
+                    if length(vals) > 1 
+                        fprintf('Warning: duplicate time value found.\n'); 
+                        % This shouldn't happen in light of the peakSeparation value being
+                        % set.
+                    end
+                    [~, ind] = min(abs(vals-median(vals)));
+                    currentTimes(ii) = vals(ind);
+                end
+
+                [currentTimes,inds] = sort(currentTimes,'ascend');
+                currentLeads = currentLeads(inds);
+                currentTimes(2:end) = diff(currentTimes);
+
+                % temp1(1:length(currentLeads),jj) = currentLeads;
+                % temp2(1:length(currentTimes),jj) = currentTimes;
+
+                currentLeadsHolder = leadsHolder;
+                currentLeadsHolder(1:length(currentLeads)) = currentLeads;
+
+                seriesAll(:,jj) = currentLeadsHolder;
+
+                currentTimesHolder = timesHolder;
+                currentTimesHolder(1:length(currentTimes)) = currentTimes;
+
+                timesAll(:,jj) = currentTimesHolder;
+
+                startEndTime(:,jj) = [totalWindows(1,hasSeries(jj));totalWindows(end,hasSeries(jj))];
+
+            end
+
+            seriesAll(:,all(isnan(timesAll))) = [];
+            startEndTime(:,all(isnan(timesAll))) = [];
+            timesAll(:,all(isnan(timesAll))) = [];
+            % For sequences that became too short after accounting for duplicate
+            % electrodes
+
+            [seriesAll,timesAll,startEndTime] = self.removeDuplicates(seriesAll,timesAll,startEndTime);
+            % For duplicate SEQUENCES, big difference
+
+            fprintf('%d total sequences found after removing duplicates. \n',size(timesAll,2)); 
+
+            self.seqResults.seriesAll = seriesAll;
+            self.seqResults.timesAll = timesAll;
+            self.seqResults.startEndTime = startEndTime;
+
+        end
+
+
+        function filterSeqByDepression(self, preWinMin, postWinMin, depressionSigma, minDurSec)
+        % FILTERSEQBYDEPRESSION  Remove SDs from seqResults that lack a sustained
+        %   ECoG amplitude depression on the detecting channel after the SD.
+        %
+        % Only intended for use after auto-mode detection (populateSpikes +
+        % computeSequences). Uses rawTimeSeries (the pre-filter signal stashed
+        % in populateSpikes), bandpass filtered to 0.5-30 Hz and converted to a
+        % moving-RMS amplitude envelope. NOT applicable to the annotations path.
+        %
+        % Criterion (per SD), on the *detecting channel only* (first electrode
+        % in the sequence):
+        %   1. Baseline = mean & SD of the envelope in the preWinMin minutes
+        %      BEFORE the SD onset (pre-SD baseline, not the test window itself).
+        %   2. Threshold = baselineMean - depressionSigma * baselineSD.
+        %   3. The SD passes if the envelope stays continuously below threshold
+        %      for at least minDurSec seconds at some point within the postWinMin
+        %      minutes AFTER onset. A single dip is not enough — the depression
+        %      must be sustained.
+        %
+        % If fewer than minBaselineSec (60 s) of pre-SD data exist, the criterion
+        % cannot be assessed and the SD is kept (passed) rather than discarded.
+        %
+        % seqResults is pruned in-place; parameters recorded in
+        % sourceLocalizationResults.paramStruct.depressionFilter.
+        %
+        % Inputs:
+        %   preWinMin        - pre-SD baseline window, minutes   (default 5)
+        %   postWinMin       - post-SD test window, minutes      (default 5)
+        %   depressionSigma  - threshold in SDs below baseline   (default 1)
+        %   minDurSec        - min continuous duration below thr (default 120 = 2 min)
+
+            if nargin < 2 || isempty(preWinMin),       preWinMin       = 5;   end
+            if nargin < 3 || isempty(postWinMin),      postWinMin      = 5;   end
+            if nargin < 4 || isempty(depressionSigma), depressionSigma = 1;   end
+            if nargin < 5 || isempty(minDurSec),       minDurSec       = 120; end
+
+            assert(~isempty(self.rawTimeSeries), ...
+                ['[filterSeqByDepression] rawTimeSeries is empty — run the auto ' ...
+                 'detection path (populateSpikes) so the raw signal is stashed.']);
+            assert(~isempty(self.Fs), '[filterSeqByDepression] Fs must be set.');
+            assert(~isempty(self.seqResults.timesAll), ...
+                '[filterSeqByDepression] seqResults is empty — run detection first.');
+            assert(~isempty(which('lauraLowBand05_30')), ...
+                '[filterSeqByDepression] lauraLowBand05_30 not on path.');
+
+            b          = lauraLowBand05_30().Numerator;        % FIR coefficients
+            nTaps      = numel(b);
+            nSamp      = size(self.rawTimeSeries, 1);
+            envWin     = round(2 * self.Fs);                   % 2 s moving-RMS window
+            preWinSamp = round(preWinMin  * 60 * self.Fs);
+            postWinSamp= round(postWinMin * 60 * self.Fs);
+            minDurSamp = round(minDurSec  * self.Fs);
+            minBaseSamp= round(60 * self.Fs);                  % 60 s minimum baseline
+
+            % ── Identify detecting channel + onset sample for each SD ──
+            sAll  = self.seqResults.seriesAll;        % maxLen x nSD cell
+            t0s   = self.seqResults.startEndTime(1,:);% 1 x nSD, absolute onset samples
+            nSD   = size(sAll, 2);
+            detChanIdx = nan(1, nSD);
+            for jj = 1:nSD
+                col = sAll(:, jj);
+                col = col(~cellfun(@isempty, col));
+                if isempty(col), continue; end
+                idx = find(strcmp(self.chanNames, col{1}), 1);  % first electrode = detecting channel
+                if ~isempty(idx), detChanIdx(jj) = idx; end
+            end
+
+            keepSD  = true(1, nSD);   % default keep; only flip to false on a clear non-depression
+            assessed = false(1, nSD);
+
+            % ── Process one unique detecting channel at a time (RAM-conscious) ──
+            uniqueChans = unique(detChanIdx(~isnan(detChanIdx)));
+            fprintf('[filterSeqByDepression] Checking %d SDs across %d detecting channel(s)...\n', ...
+                nSD, numel(uniqueChans));
+
+            for c = uniqueChans(:)'
+                % Bandpass + moving-RMS envelope for this channel only
+                x = double(self.rawTimeSeries(:, c));
+                v = ~isnan(x);
+                xf = nan(nSamp, 1);
+                if nnz(v) > nTaps * 3
+                    xf(v) = filtfilt(b, 1, x(v));
+                end
+                clear x
+                xf  = xf .^ 2;
+                env = sqrt(movmean(xf, envWin, 'omitnan'));   % full-res amplitude envelope
+                clear xf
+
+                % Evaluate every SD detected on this channel
+                sdsHere = find(detChanIdx == c);
+                for jj = sdsHere
+                    t0 = t0s(jj);
+                    if isnan(t0), continue; end
+                    t0 = round(t0);
+
+                    % Pre-SD baseline window: [t0 - preWinSamp, t0)
+                    bStart = max(1, t0 - preWinSamp);
+                    bEnd   = t0 - 1;
+                    if bEnd - bStart + 1 < minBaseSamp
+                        % Not enough baseline — cannot assess, leave SD kept
+                        continue
+                    end
+                    baseSeg = env(bStart:bEnd);
+                    baseMu  = mean(baseSeg, 'omitnan');
+                    baseSd  = std(baseSeg, 0, 'omitnan');
+                    if isnan(baseMu) || baseSd == 0
+                        continue   % degenerate baseline — cannot assess, keep
+                    end
+                    thresh = baseMu - depressionSigma * baseSd;
+
+                    % Post-SD test window: [t0, t0 + postWinSamp]
+                    tStart = t0;
+                    tEnd   = min(nSamp, t0 + postWinSamp);
+                    testSeg = env(tStart:tEnd);
+
+                    % Longest continuous run below threshold (NaN breaks runs)
+                    below = testSeg < thresh;          % logical; NaN<thr is false
+                    runEdges  = diff([0; below(:); 0]);
+                    runStarts = find(runEdges == 1);
+                    runEnds   = find(runEdges == -1) - 1;
+                    maxRunLen = 0;
+                    if ~isempty(runStarts)
+                        maxRunLen = max(runEnds - runStarts + 1);
+                    end
+
+                    assessed(jj) = true;
+                    keepSD(jj)   = maxRunLen >= minDurSamp;   % sustained depression?
+                end
+
+                clear env
+            end
+
+            nKept    = sum(keepSD);
+            nRemoved = nSD - nKept;
+            fprintf(['[filterSeqByDepression] %d / %d SDs passed (%d removed; ' ...
+                '%d could not be assessed and were kept).\n'], ...
+                nKept, nSD, nRemoved, sum(~assessed));
+
+            % ── Prune seqResults in-place ──
+            self.seqResults.seriesAll    = self.seqResults.seriesAll(:, keepSD);
+            self.seqResults.timesAll     = self.seqResults.timesAll(:, keepSD);
+            self.seqResults.startEndTime = self.seqResults.startEndTime(:, keepSD);
+
+            % ── Record parameters ──
+            self.sourceLocalizationResults.paramStruct.depressionFilter = struct( ...
+                'applied',         true,            ...
+                'preWinMin',       preWinMin,       ...
+                'postWinMin',      postWinMin,      ...
+                'depressionSigma', depressionSigma, ...
+                'minDurSec',       minDurSec,       ...
+                'channel',         'detecting only',...
+                'baseline',        'pre-SD window', ...
+                'nOriginal',       nSD,             ...
+                'nKept',           nKept,           ...
+                'nUnassessed',     sum(~assessed));
+
+        end
+
+        function computeBandpassEnvelope(self, dispDec, envWinSec, forceNew)
+        % COMPUTEBANDPASSENVELOPE  Build a decimated 0.5-30 Hz RMS amplitude
+        %   envelope of rawTimeSeries for display overlay.
+        %
+        %   Plotting the raw bandpass oscillation fails because plotTimeSeries
+        %   subsamples the display by ~dispDec; subsampling a 0.5-30 Hz signal
+        %   aliases it into slow artifacts. The amplitude *envelope* is slow-
+        %   varying, so it survives decimation and directly shows the post-SD
+        %   depression (a drop in high-frequency power).
+        %
+        %   Computed once and cached in self.bpEnvelope. RAM- and time-conscious:
+        %   processes ONE channel at a time, frees each full-resolution column
+        %   immediately, and stores only the small decimated envelope (single).
+        %
+        % Inputs:
+        %   dispDec    - display decimation factor (samples kept = 1:dispDec:end)
+        %   envWinSec  - moving-RMS window in seconds (default 2). Must be long
+        %                enough that win >= dispDec so decimation is alias-safe.
+        %   forceNew   - recompute even if a matching cache exists (default false)
+
+            if nargin < 3 || isempty(envWinSec), envWinSec = 2;     end
+            if nargin < 4 || isempty(forceNew),  forceNew  = false; end
+
+            assert(~isempty(self.rawTimeSeries), ...
+                ['[computeBandpassEnvelope] rawTimeSeries is empty — run ' ...
+                 'prepareDeltaPosition first so the raw signal is stashed.']);
+            assert(~isempty(self.Fs), '[computeBandpassEnvelope] Fs not set.');
+            assert(~isempty(which('lauraLowBand05_30')), ...
+                '[computeBandpassEnvelope] lauraLowBand05_30 not on path.');
+
+            % ── Cache check: skip if already built with the same parameters ──
+            if ~forceNew && ~isempty(self.bpEnvelope) && ~isempty(self.bpEnvelopeParams) ...
+                    && self.bpEnvelopeParams.dispDec   == dispDec ...
+                    && self.bpEnvelopeParams.envWinSec == envWinSec ...
+                    && self.bpEnvelopeParams.Fs        == self.Fs
+                return;
+            end
+
+            b       = lauraLowBand05_30().Numerator;     % FIR coefficients
+            nTaps   = numel(b);
+            nSamp   = size(self.rawTimeSeries, 1);
+            nChan   = size(self.rawTimeSeries, 2);
+
+            % Moving-RMS window in samples; force >= dispDec for alias-safe decimation
+            win     = max(round(envWinSec * self.Fs), dispDec);
+
+            % Pre-size decimated output (single to halve memory; it's tiny anyway)
+            decIdx  = 1:dispDec:nSamp;
+            self.bpEnvelope = zeros(numel(decIdx), nChan, 'single');
+
+            fprintf('[computeBandpassEnvelope] %d channels, %d samples each, %d-tap FIR.\n', ...
+                nChan, nSamp, nTaps);
+
+            for c = 1:nChan
+                fprintf('  channel %d/%d ... ', c, nChan); tStart = tic;
+
+                % --- one full-resolution column at a time ---
+                x = double(self.rawTimeSeries(:, c));      % ~8 bytes * nSamp
+                v = ~isnan(x);
+
+                xf = nan(nSamp, 1);
+                if nnz(v) > nTaps * 3
+                    xf(v) = filtfilt(b, 1, x(v));          % zero-phase bandpass
+                end
+                clear x                                    % free immediately
+
+                % Moving-RMS envelope: sqrt of windowed mean power
+                xf = xf .^ 2;                              % power (reuse xf storage)
+                env = sqrt(movmean(xf, win, 'omitnan'));
+                clear xf
+
+                % Decimate the (slow) envelope — alias-safe because win >= dispDec
+                self.bpEnvelope(:, c) = single(env(decIdx));
+                clear env
+
+                fprintf('done (%.1fs)\n', toc(tStart));
+            end
+
+            self.bpEnvelopeParams = struct( ...
+                'dispDec',   dispDec, ...
+                'envWinSec', envWinSec, ...
+                'win',       win, ...
+                'Fs',        self.Fs, ...
+                'band',      '0.5-30 Hz', ...
+                'nSamp',     nSamp);
+
+            fprintf(['[computeBandpassEnvelope] Done. Envelope cached (%d x %d, single). ' ...
+                'rawTimeSeries no longer needed for plotting and may be cleared to free RAM.\n'], ...
+                size(self.bpEnvelope,1), size(self.bpEnvelope,2));
+        end
+
+        function spikeSequenceToDeltaPosition(self)
+
+            %% Preamble
+
+            intervalMax = self.sourceLocalizationResults.paramStruct.sensorDistance / self.sourceLocalizationResults.paramStruct.propagationSpeed; % Seconds
+            intervalMax = intervalMax * self.Fs;
+
+            % subsensorLength = 3;
+
+            % pairHits = zeros(length(chanNames));
+
+            spkLeads = self.seqResults.seriesAll;
+            spkTimes = self.seqResults.timesAll;
+
+            self.getSensors;
+
+            %% Prepare ingredients
+
+            sensorInds = self.sensors.sensorInds;
+            sensorFlip = [sensorInds; fliplr(sensorInds)];
+
+            %% Build table
+
+            seriesTable = nan(size(sensorInds,1),size(spkTimes,2));
+            if isempty(seriesTable); return; end
+
+            for jj = 1:size(spkTimes,2)
+
+                currentSeries = spkLeads(:,jj);
+                currentTimes = spkTimes(:,jj);
+                currentSeries = currentSeries(~isnan(currentTimes));
+                currentTimes = currentTimes(~isnan(currentTimes));
+
+                if length(currentTimes) < self.sourceLocalizationResults.paramStruct.subsensorLength; continue; end
+
+                currentTimes(1) = 0;
+                for ii = 2:length(currentTimes)
+                    currentTimes(ii) = sum(currentTimes(ii - 1:ii));
+                end
+
+                [~,leadIndices] = ismember(currentSeries,self.chanNames);
+                pairIndices = nchoosek(1:length(currentSeries),2);
+
+                leadPairs = leadIndices(pairIndices);
+
+                [a,b] = ismember(leadPairs,sensorFlip,'rows');
+                if sum(a) < self.sourceLocalizationResults.paramStruct.subsensorLength; continue; end
+
+                pairIndices(b > size(sensorInds,1),:) = fliplr(pairIndices(b > size(sensorInds,1),:));
+                pairIndices = pairIndices(a,:);
+
+                %     leadPairs = leadIndices(pairIndices);
+                %     for ii = 1:size(leadPairs,1)
+                %         pairHits(leadPairs(ii,1),leadPairs(ii,2)) = pairHits(leadPairs(ii,1),leadPairs(ii,2)) + 1;
+                %     end
+
+                b(b > size(sensorInds,1)) = b(b > size(sensorInds,1)) - size(sensorInds,1);
+                b = b(a);
+
+                pairTimes = currentTimes(pairIndices);
+                diffTimes = -diff(pairTimes,1,2);
+                belowInterval = abs(diffTimes) <= intervalMax;
+                if sum(belowInterval) < self.sourceLocalizationResults.paramStruct.subsensorLength; continue; end
+                % It will be very unusual to get here, since the <100 ms requirement is
+                % enforced by the sequence collection scheme.
+                % Unless of course we're using a different propagation speed or
+                % something like that
+
+                diffTimes = diffTimes(belowInterval);
+                b = b(belowInterval);
+
+                seriesTable(b,jj) = diffTimes; % Samples
+                % Lead 1 time - lead 2 time
+
+            end
+
+            % spkTimes(:,all(isnan(seriesTable))) = [];
+            % spkLeads(:,all(isnan(seriesTable))) = [];
+            % % I used to pass these back as outputs. Not sure if they're needed.
+            % % If they are, I should get a "not enough output arguments" error.
+            % % Again though, if they are, better to pass them back in params
+            % % rather than as outputs.
+            %
+            % structKey(all(isnan(seriesTable))) = [];
+
+            seriesTable(:,all(isnan(seriesTable))) = [];
+
+            %% Pack up
+
+            % params.subsensorLength = subsensorLength;
+            % params.structKey = structKey;
+            % params.spikeTimes = spkTimes; % For various reasons I find it's helpful to pass this back in params.
+            % params.spikeLeads = spkLeads;
+
+            self.deltaPosition = seriesTable;
+
+            % I think it's good to put this into the sensors struct,
+            % because seriesTable should have the same height as
+            % sensorInds.
+
+        end
+
+        %% Generic functions for setting up brain anatomy and electrode utilization
+
+        function getSensors(self)
+
+            self.loadGeodesic;
+            sensorDistance = self.sourceLocalizationResults.paramStruct.sensorDistance;
+
+            geodesicDistancesMaster = self.geodesic.geodesicDistances;
+            vertexNums = self.geodesic.vertexNums;
+
+            isLeft = self.geodesic.isLeftInds;
+
+            % distancesMaster = geodesicMaster(:,vertexNums);
+            % Unfortunately the above doesn't work anymore, now with Depths.
+            % Some elements of vertexNums are NaNs, corresponding to depth electrodes I
+            % couldn't localize.
+            distancesMaster = nan(length(vertexNums));
+            isGood = ~isnan(vertexNums);
+            distancesMaster(:,isGood) = geodesicDistancesMaster(:,vertexNums(isGood));
+
+            oppositeSideMask = xor(isLeft,isLeft');
+            distancesMaster(oppositeSideMask) = nan;
+            % distancesMaster(oppositeSideMask) = Inf;
+            % warning('Contralateral sensors Inf.');
+
+            [ii,jj] = find(distancesMaster <= sensorDistance);
+            sensorsMaster = [ii jj];
+
+            sensorsMaster = sensorsMaster(ii < jj,:);
+
+            sensorStruct.sensorInds = sensorsMaster;
+            sensorStruct.distancesMaster = distancesMaster;
+            sensorStruct.sensorDistance = sensorDistance; % Can still save this on the way out
+
+            self.sensors = sensorStruct;
+
+        end
+
+        function loadGeodesic(self,varargin)
+
+            %% Preamble
+
+            p = inputParser;
+            addParameter(p,'unModified',false);
+            addParameter(p,'forceNew',false);
+            addParameter(p,'saving',true);
+            parse(p,varargin{:})
+            unModified = p.Results.unModified;
+            forceNew = p.Results.forceNew;
+            saving = p.Results.saving;
+
+            %% Load or create, unpack
+
+            if ~isempty(self.geodesic) && ~isequal(length(self.chanNames),length(self.geodesic.leadNames)); forceNew = true; end
+            if ~isempty(self.geodesic) && ~forceNew; return; end
+
+            geodesicMaster = self.collectGeodesicDistances_master('saving',saving);
+
+            %% Modify
+
+            if unModified
+                self.geodesic = geodesicMaster;
+                return;
+            end
+
+            %% Unpack
+
+            [chanLog,chanInds] = ismember(self.chanNames,geodesicMaster.leadNames);
+            % missingLeads = setdiff(chanNames,leadsFromGeodesic);
+            missingLeads = self.chanNames(~chanLog);
+
+            if ~all(chanLog)
+                warning('Channels submitted that are missing from our records.');
+
+                disp(missingLeads);
+                % JD 5/6/2023:
+                % The new (improved) paradigm is that geodesicDistances should be
+                % created ONLY using leads.csv. In other words, functionality which
+                % cross-checks leads with time series (typically Jacksheet leads) with
+                % leads with localization, has been removed. We should use only and all
+                % the leads in leads.csv to create geodesic. Then pull relevant leads
+                % from that 'master' list later.
+
+                % So as of that time, there's no solid reason to programatically
+                % re-make geodesic.
+
+            end
+
+            % The above doesn't work anymore because we need to permit tolerance of
+            % missing values.
+            % Under this new paradigm (3/6/23) we will proceed with localization even
+            % if there are channels in jacksheet that failed to localize.
+
+            leadsFromGeodesic = repmat({''},size(self.chanNames));
+            leadsFromGeodesic(chanLog) = geodesicMaster.leadNames(chanInds(chanLog));
+            % Should match chanNames, minus the missing channels
+
+            geodesicDistances = nan(length(self.chanNames),size(geodesicMaster.geodesicDistances,2));
+            geodesicDistances(chanLog,:) = geodesicMaster.geodesicDistances(chanInds(chanLog),:);
+
+            vertexNums = nan(1,length(self.chanNames));
+            vertexNums(chanLog) = geodesicMaster.vertexNums(chanInds(chanLog));
+
+            isLeftInds = false(size(self.chanNames));
+            isLeftInds(chanLog) = geodesicMaster.isLeftInds(chanInds(chanLog));
+            % A bit risque to initialize this is as false. It should be fine, though,
+            % because all other fields are nan so we won't be able to do anything with
+            % the unlocalized ones (chanNames(~chanLog)).
+
+            [leadLocations,leadLocationsPial] = deal(nan(length(chanInds),3));
+            leadLocations(chanLog,:) = geodesicMaster.leadLocations(chanInds(chanLog),:);
+            leadLocationsPial(chanLog,:) = geodesicMaster.leadLocationsPial(chanInds(chanLog),:);
+
+            distanceFull = nan(1,length(self.chanNames));
+            distanceFull(chanLog) = geodesicMaster.distanceFull(chanInds(chanLog));
+
+            %% Pack
+
+            self.geodesic.geodesicDistances = geodesicDistances;
+            self.geodesic.vertexNums = vertexNums;
+            self.geodesic.isLeftInds = isLeftInds;
+            self.geodesic.leadLocations = leadLocations;
+            self.geodesic.leadLocationsPial = leadLocationsPial;
+            self.geodesic.leadNames = leadsFromGeodesic;
+
+            self.geodesic.distanceFull = distanceFull;
+
+        end
+
+        function geodesicMaster = collectGeodesicDistances_master(self,varargin)
+
+            %% Preamble
+
+            p = inputParser;
+            addParameter(p,'saving',true);
+            addParameter(p,'forceNew',false);
+            parse(p,varargin{:})
+            saving = p.Results.saving;
+            forceNew = p.Results.forceNew;
+
+            fn = fullfile(self.subjFolder,sprintf('geodesic_%s.mat',self.subj));
+
+            if ~forceNew && exist(fn,'file')
+                load(fn,'geodesicMaster');
+                return
+            end
+
+            tic
+
+            [myBd, myBp] = self.retrieveBraindata;
+
+            fprintf('Building geodesic distances for %s. This can take up to 10 minutes. \n',self.subj);
+
+            %% Go on to build the geodesic distances
+
+            surfL = myBp.surfaces.pial_lh;
+            surfR = myBp.surfaces.pial_rh;
+            numVert = myBd.stdNumVertices;
+
+            leadsDir = fullfile(self.subjFolder,'/tal/leads.csv');
+            assert(exist(leadsDir,'file'));
+            t = readtable(leadsDir);
+
+            isLeftInds = t.x < 0;
+
+            leadLocations = table2array(t(:,{'x','y','z'}));
+            leadNames = t.chanName;
+            numLeads = length(leadNames);
+
+            %%%%%%%%%%%%%%
+            % Which hemi?
+            %%%%%%%%%%%%%%
+
+            distanceThresh = 5; % mm
+
+            leadToVertex = nan(1,numLeads);
+            distanceFull = nan(1,numLeads);
+
+            % Left
+            leadDistance = pdist2(surfL.vertices,leadLocations(isLeftInds,:));
+            [valsLeft,closestVert] = min(leadDistance);
+            closestVert(valsLeft >= distanceThresh) = nan;
+            leadToVertex(isLeftInds) = closestVert;
+            distanceFull(isLeftInds) = valsLeft;
+
+            % Right
+            leadDistance = pdist2(surfR.vertices,leadLocations(~isLeftInds,:));
+            [valsRight,closestVert] = min(leadDistance);
+            closestVert(valsRight >= distanceThresh) = nan;
+            leadToVertex(~isLeftInds) = closestVert;
+            distanceFull(~isLeftInds) = valsRight;
+
+            leadLocationsPial = nan(numLeads,3);
+
+            isLeftInds = revertToVector(isLeftInds);
+            assert(size(isLeftInds,1)==1 && size(leadToVertex,1)==1);
+
+            leadLocationsPial(isLeftInds & ~isnan(leadToVertex),:) = surfL.vertices(leadToVertex(isLeftInds & ~isnan(leadToVertex)),:);
+            leadLocationsPial(~isLeftInds & ~isnan(leadToVertex),:) = surfR.vertices(leadToVertex(~isLeftInds & ~isnan(leadToVertex)),:);
+            % If use alternative is on, this maps STANDARD leadToVertex, using the ALT
+            % surface, to Euclidean space
+
+            %%
+
+            geodesicDistanceMaster = nan(numLeads,numVert);
+
+            parfor ii = 1:numLeads
+
+                if isnan(leadToVertex(ii)); continue; end
+
+                if isLeftInds(ii); geodesicDistanceMaster(ii,:) = myBp.dist_geodesic(surfL, leadToVertex(ii));
+                else; geodesicDistanceMaster(ii,:) = myBp.dist_geodesic(surfR, leadToVertex(ii));
+                end
+
+            end
+
+            geodesicMaster.geodesicDistances = geodesicDistanceMaster;
+            geodesicMaster.vertexNums = leadToVertex;
+            geodesicMaster.isLeftInds = isLeftInds;
+            geodesicMaster.leadLocationsPial = leadLocationsPial;
+            geodesicMaster.leadLocations = leadLocations;  % Dural
+            geodesicMaster.leadNames = leadNames;
+            geodesicMaster.distanceThresh = distanceThresh;
+            geodesicMaster.distanceFull = distanceFull;
+
+            fprintf('Geodesic distances built in %.3f seconds \n',toc)
+
+            if saving; save(fn,'geodesicMaster'); end
+
+        end
+
+        %% The actual localization function 
+        % The workhorse 
+
+        function localizationFunction(self,varargin)
+
+            p = inputParser;
+            addParameter(p,'forceNew',false);
+            parse(p,varargin{:})
+            forceNew = p.Results.forceNew;
+
+            %% Preamble
+
+            if ~forceNew && ~isempty(self.sourceLocalizationResults.localizationResults); return; end
+
+            %% Onto the function
+
+            tic
+
+            deltaPositionLocal = self.deltaPosition / self.Fs; % Seconds
+            deltaPositionLocal = deltaPositionLocal * self.sourceLocalizationResults.paramStruct.propagationSpeed; % mm
+
+            lengthData = size(deltaPositionLocal,2);
+            sensorInds = self.sensors.sensorInds;
+
+            myBp = self.braindata.myBp;
+
+            self.loadGeodesic;
+
+            geodesicDistancesMaster = self.geodesic.geodesicDistances;
+
+            isLeftInds = self.geodesic.isLeftInds;
+            isLeftSensors = isLeftInds(sensorInds(:,1));
+
+            lVertices = myBp.surfaces.pial_lh.vertices;
+            rVertices = myBp.surfaces.pial_rh.vertices;
+
+            marginError = .5;
+            % This is measured in mm. It's the difference between perceived and actual
+            % delta distance, among our candidate vertices, which we tolerate.
+            % Think of this as the thickness of the tolerance band.
+
+            distancesMaster = self.sensors.distancesMaster;
+
+            distanceNorm = zeros(length(sensorInds),1);
+            % ddMaster = zeros(size(sensors,1),size(geodesicMaster,2));
+            boundsMaster = false(size(sensorInds,1),size(geodesicDistancesMaster,2));
+
+            % distanceThresh = 30;  % mm
+            distanceThresh = self.sourceLocalizationResults.paramStruct.distanceThresh;
+            % Beyond this distance, candidate source vertices are disregarded.
+            % Literature (Smith, Schevon, Nat Comm 2016, among other work) suggests
+            % that ~3cm is the ceiling above which neural signals are unlikely to
+            % travel.
+
+            for ii = 1:size(sensorInds,1)
+
+                currentSensor = sensorInds(ii,:);
+
+                distanceNorm(ii) = distancesMaster(currentSensor(1),currentSensor(2));
+
+                % ddMaster(ii,:) = geodesicMaster(currentSensor(1),:) - geodesicMaster(currentSensor(2),:);
+                % Perhaps move away from initializing this DD master. It creates a
+                % massive array which is then broadcast by the parallel pool.
+                % We can define these distances anew for each sensor pair.
+
+                boundsMaster(ii,:) = max([geodesicDistancesMaster(currentSensor(1),:); geodesicDistancesMaster(currentSensor(2),:)]) < distanceThresh;
+
+            end
+
+            %% Localization
+
+            localizationResults = nan(3,lengthData);
+
+            subsensorLength = self.sourceLocalizationResults.paramStruct.subsensorLength;
+            perceivedActualCutoff = 0.9;
+
+            parfor jj = 1:lengthData
+
+                locTemp = nan(3,1);
+
+                % currentSubsensor = find(~isnan(drAll(:,jj)));
+                currentSubsensor = find(abs(deltaPositionLocal(:,jj)) < distanceNorm * perceivedActualCutoff);
+                % Perceived actual cutoff doesn't affect our source localization procedure itself. Rather, it
+                % LIMITS the number of electrode pairs included in our procedure. The
+                % reason is that, if deltaPosition(p,jj) is too close to distanceNorm(p),
+                % for some sensor pair p, then the hyperbola starts to look like a
+                % hairpin, that is, very eccentrically-bent towards the electrode. This
+                % limits the number of available cortical surface points, which can
+                % cause the hyperbola to become spotty and could mislead results.
+
+                %%%%
+                % Continue if we have a short subsensor.
+                if length(currentSubsensor) < subsensorLength; continue; end
+                %%%%
+
+                isLeftSubsensor = isLeftSensors(currentSubsensor);
+                useLeft = round(sum(isLeftSubsensor) / length(isLeftSubsensor));
+
+                if useLeft; currentSubsensor = currentSubsensor(isLeftSubsensor);
+                else; currentSubsensor = currentSubsensor(~isLeftSubsensor);
+                end
+
+                if length(currentSubsensor) < subsensorLength; continue; end
+
+                drSubsensor = deltaPositionLocal(currentSubsensor,jj);
+
+                % eligiblePoints = logical(sum(boundsMaster(currentSubsensor,:)));
+                eligiblePoints = sum(boundsMaster(currentSubsensor,:)) >= 1; % Union of all source spaces
+                % This enforces the requirement that the chosen point at least
+                % distanceThresh from at least ONE electrode pair.
+                eligiblePointsIndex = find(eligiblePoints);
+
+                % Which hemisphere are we on?
+                if isLeftSensors(currentSubsensor(1)); eligiblePoints = lVertices(eligiblePoints,:);
+                else; eligiblePoints = rVertices(eligiblePoints,:);
+                end
+
+                sourceToVertex = zeros(length(currentSubsensor), size(eligiblePoints,1),'single');
+
+                emptyCheck = false(size(currentSubsensor));
+
+                for ii = 1:length(currentSubsensor)
+
+                    currentDr = drSubsensor(ii);
+
+                    currentSensor = sensorInds(currentSubsensor(ii),:);
+
+                    % diffDistance = ddMaster(currentSubsensor(ii),:);
+                    diffDistance = geodesicDistancesMaster(currentSensor(1),:) - geodesicDistancesMaster(currentSensor(2),:);
+                    maxDistance = boundsMaster(currentSubsensor(ii),:);
+                    % maxDistance = max([geodesicMaster(currentSensor(1),:); geodesicMaster(currentSensor(2),:)]) < distanceThresh;
+
+                    chosenVertices = abs(diffDistance - currentDr) < marginError;
+                    chosenVertices = chosenVertices & maxDistance;
+                    % Refine the hyperbola so that it extends no more than distanceThresh from
+                    % either electrode
+
+                    if ~any(chosenVertices)
+                        emptyCheck(ii) = true;
+                        warning('Empty vertex set found for step %d. \n',jj);
+                        continue;
+                    end
+
+                    if isLeftSensors(currentSubsensor(1)); chosenVertices = lVertices(chosenVertices,:);
+                    else; chosenVertices = rVertices(chosenVertices,:);
+                    end
+
+                    % dT = delaunayn(double(chosenVertices));
+                    % [~,sourceToVertex(ii,:)] = dsearchn(double(chosenVertices),dT,double(eligiblePoints));
+                    % Slower
+
+                    pointsDistances = pdist2(chosenVertices,eligiblePoints);
+                    % For each eligible vertex, find the distance from that point to
+                    % all points on the hyperbola
+
+                    sourceToVertex(ii,:) = min(pointsDistances);
+                    % For each eligible vertex, find the distance from that point to
+                    % the CLOSEST point on the hyperbola
+
+                end
+
+                if sum(~emptyCheck) < subsensorLength; continue; end
+                sourceToVertex(emptyCheck,:) = [];
+
+                [minVal,ind] = min(mean(sourceToVertex .^ 2)); % L2 norm
+                % [minVal,ind] = min(mean(sourceToVertex)); % L1 norm
+
+                ind = eligiblePointsIndex(ind);
+
+                isLeft = isLeftSensors(currentSubsensor(1));
+                if isLeft; ind = ind * -1; end
+
+                locTemp(1) = ind;
+                locTemp(2) = minVal;
+                locTemp(3) = jj;
+
+                localizationResults(:,jj) = locTemp;
+
+            end
+
+            fprintf('Localization completed in %.2f seconds. \n',toc);
+            fprintf('%.f percent of samples gave rise to a localization, for a total of %d localized points. \n',sum(~isnan(localizationResults(2,:))) / lengthData * 100,sum(~isnan(localizationResults(2,:))));
+
+            %% Quality control?
+
+            % localizationResults(:,isnan(localizationResults(1,:))) = []; 
+            % 
+            % qualityControlThresh = 10; % mm;
+            % badInds = localizationResults(2,:) > qualityControlThresh;
+            % localizationResults(:,badInds) = [];
+
+            %% Pack up
+
+            self.sourceLocalizationResults.localizationResults = localizationResults;
+
+            self.sourceLocalizationResults.paramStruct.marginError = marginError;
+            self.sourceLocalizationResults.paramStruct.distanceThresh = distanceThresh;
+            self.sourceLocalizationResults.paramStruct.perceivedActualCutoff = perceivedActualCutoff;
+
+            % self.sourceLocalizationResults.paramStruct.qualityControlThresh = qualityControlThresh;
+
+            self.sourceLocalizationResults.paramStruct.originalSize = lengthData; 
+
+            self.sourceLocalizationResults.paramStruct.meta.subj = self.subj; 
+            % Others?
+
+            %% Clear cached
+
+            sl.sourceLocalizationResults.roiResults = []; 
+
+        end
+
+        %% Plotting or post-localization analysis 
+
+        function locDataToRoi(self,varargin)
+
+            p = inputParser;
+            addParameter(p,'forceNew',false);
+            addParameter(p,'timeWindow',0); % Seconds
+            parse(p,varargin{:})
+            forceNew = p.Results.forceNew;
+            timeWindow = p.Results.timeWindow;
+
+            if ~forceNew && ~isempty(self.sourceLocalizationResults.roiResults); return; end
+
+            assert(~timeWindow);
+
+            self.localizationFunction; % Needs to be done; no need to pass forceNew;
+
+            myBd = self.retrieveBraindata;
+
+            roiRadius = Inf;
+            sumEmpty = 0;
+
+            thisLocalizationResults = self.sourceLocalizationResults.localizationResults;
+            assert(~isempty(thisLocalizationResults),'No data to plot.');
+
+            % lengthTs = size(thisLocalizationResults,2);
+            lengthTs = self.sourceLocalizationResults.paramStruct.originalSize;
+
+            if ~timeWindow
+                timeWindowSamples = lengthTs; % Samples
+            else; timeWindowSamples = timeWindow * self.Fs; % Samples
+            end
+            % Set timeWindow to lengthTs if 0, so that this just creates a
+            % single step in timeBuffer.
+
+            stepsBuffer = buffer(1:lengthTs,timeWindowSamples);
+            vMapAll = cell(size(stepsBuffer,2),1);
+
+            maxValAll = zeros(1,size(stepsBuffer,2));
+
+            %%
+
+            for jj = 1:size(stepsBuffer,2)
+
+                maxVal = 0;
+
+                currentTime = stepsBuffer(:,jj);
+                currentTime = currentTime(logical(currentTime));
+
+                currentLocs = thisLocalizationResults(:,ismember(thisLocalizationResults(3,:),currentTime));
+
+                currentVertices = currentLocs(1,:);
+
+                if isempty(currentVertices); continue; end
+                uniqueVertex = unique(currentVertices);
+
+                vertexMap = containers.Map('keyType','double','valueType','any');
+
+                for vertIndex = uniqueVertex
+                    currentInds = ismember(currentVertices,vertIndex);
+                    numVertices = sum(currentInds);
+
+                    isLeft = sign(vertIndex) == -1;
+
+                    if isLeft; surfString = 'lh'; currentSign = -1;
+                    else; surfString = 'rh'; currentSign = 1;
+                    end
+                    % Let's give left-sided vertices a negative sign.
+
+                    [roicUnique, ~, roiOutput] = myBd.vertex2ROI(abs(vertIndex),surfString,roiRadius);
+
+                    if isempty(roicUnique); sumEmpty = sumEmpty + numVertices; continue; end
+                    roicUnique = roicUnique';
+                    roiAll = roiOutput.ROIC_mesh_ndx;
+
+                    for roicIndex = roicUnique
+
+                        if isKey(vertexMap,roicIndex * currentSign)
+                            roiStruct = vertexMap(roicIndex * currentSign);
+                            roiStruct.count = roiStruct.count + numVertices;
+                        else
+                            roiStruct = struct;
+                            roiStruct.count = numVertices;
+                            roiStruct.roi = roiOutput.vertex(roiAll == roicIndex);
+                        end
+
+                        maxVal = max(maxVal,roiStruct.count);
+                        vertexMap(roicIndex * currentSign) = roiStruct;
+                    end
+
+                end
+
+                vMapAll{jj} = vertexMap;
+
+                maxValAll(jj) = maxVal;
+
+            end
+
+            %%
+
+            if sumEmpty; fprintf('%d unrecognized vertices found for %s.\n',sumEmpty,self.subj); end
+            % fprintf('ROI data computed in %.1f seconds. \n',toc)
+
+            roiResults = struct;
+            roiResults.vertexMap = vMapAll;
+            roiResults.timeWindow = timeWindow;
+            roiResults.roiRadius = roiRadius;
+            roiResults.maxValAll = maxValAll;
+
+            self.sourceLocalizationResults.roiResults = roiResults;
+
+        end
+
+        function [maxRoic,roicTable] = findTopRoic(self)
+
+            vertexMap = self.sourceLocalizationResults.roiResults.vertexMap{1};
+            roicTable = zeros(length(vertexMap),3);
+
+            if isempty(vertexMap)
+                maxRoic = nan;
+                return
+            end
+
+            %%
+
+            mapKeys = cell2mat(vertexMap.keys);
+            for ii = 1:length(mapKeys)
+                roiStruct = vertexMap(mapKeys(ii));
+
+                roicTable(ii,1) = mapKeys(ii);
+                roicTable(ii,2) = roiStruct.count;
+
+                if isfield(roiStruct,'times'); roicTable(ii,3) = mean(roiStruct.times); end
+
+            end
+
+            %%
+
+            [~,inds] = sort(roicTable(:,2),'descend');
+            roicTable = roicTable(inds,:);
+
+            maxRoic = roicTable(1,1);
+
+
+        end
+
+        function plotSurfFun(self, varargin)
+
+            %% Preamble
+
+            %%%%
+            % For seizure source info
+            %%%%
+
+            [myBd, myBp] = self.retrieveBraindata;
+
+            isLeftInds = self.geodesic.isLeftInds;
+            useLeft = logical(round(sum(isLeftInds) / length(isLeftInds)));
+
+            p = inputParser;
+            addParameter(p, 'currentAz', -90 * useLeft + 90 * ~useLeft);
+            addParameter(p, 'currentEl', -90);
+            parse(p,varargin{:})
+            currentEl = p.Results.currentEl;
+            currentAz = p.Results.currentAz;
+
+
+            %% Brain plot
+
+            %%%%%
+            % Basic setup
+            %%%%%
+
+            colormap(jet);
+            figure
+            myBd.ezplot(myBp,gca); % If we would not like to include the resection territory
+            % plotResectionSurf(myStruct) % If we would like to include the resection territory
+            view(currentAz, currentEl);
+
+            myBp.camlights(5);
+            ax = gca;
+
+            %%  Grab and set up ROI results
+
+            assert(~isempty(self.sourceLocalizationResults.localizationResults),'No data to plot.');
+            self.locDataToRoi;
+            roiResults = self.sourceLocalizationResults.roiResults;
+            vertexMap = roiResults.vertexMap;
+            % clim = roiResults.clim;
+
+            maxColor = max(self.sourceLocalizationResults.roiResults.maxValAll); 
+            colorLimits = [1 max(maxColor)];
+
+            %% Plot what we have
+
+            lastPlot = false;
+
+            for jj = 1:length(vertexMap)
+
+                if ~isempty(vertexMap{jj})
+
+                    vertexMapLocal = vertexMap{jj};
+
+                    mapKeys = cell2mat(vertexMapLocal.keys);
+                    VPerROI = cell(size(mapKeys));
+                    valPerROI = zeros(size(mapKeys));
+
+                    for ii = 1:length(mapKeys)
+                        roiStruct = vertexMapLocal(mapKeys(ii));
+                        VPerROI{ii} = roiStruct.roi;
+                        valPerROI(ii) = roiStruct.count;
+                    end
+
+                    isLeft = sign(mapKeys) == -1;
+
+                    % axes(ax);
+                    if lastPlot; myBp.clearRegions(); end
+
+                    if all(isLeft)
+                        myBp.plotRegionsData(VPerROI, valPerROI,'surf','lh','clim',colorLimits,'cmap',turbo);
+                    elseif all(~isLeft)
+                        myBp.plotRegionsData(VPerROI, valPerROI,'surf','rh','clim',colorLimits,'cmap',turbo);
+                    else
+                        [isLeft,sortInds] = sort(isLeft,'descend');
+                        VPerROI = VPerROI(sortInds);
+                        valPerROI = valPerROI(sortInds);
+                        rh_begin = find(~isLeft,1);
+
+                        myBp.plotRegionsData(VPerROI, valPerROI,'rh_begin',rh_begin,'clim',colorLimits,'cmap',turbo);
+                    end
+                    fprintf('%d ROICs plotted; %d total ROI hits. \n',length(mapKeys),sum(valPerROI));
+                    lastPlot = true;
+                elseif lastPlot
+                    % axes(ax);
+                    myBp.clearRegions();
+                    lastPlot = false;
+                end
+                drawnow
+            end
+
+        end
+
+        function plotDimensionsReducedWrapper(self,varargin)
+
+            p = inputParser;
+            addParameter(p,'colorMode','auto'); % timing; heatmap
+            parse(p,varargin{:})
+            colorMode = p.Results.colorMode;
+
+            figure
+
+            useMatrices = {[1 0 0; 0 1 0; 0 0 1],... axial 
+                [1 0 0; 0 0 1; 0 1 0],... coronal 
+                [0 0 1; 1 0 0; 0 1 0]}; %  sagittal
+
+            for ii = 1:length(useMatrices)
+
+                subplot(1,length(useMatrices),ii) 
+                self.plotDimensionReduced('coeff',useMatrices{ii},'colorMode',colorMode);
+
+            end
+
+        end
+
+        function plotDimensionReduced(self,varargin)
+
+            p = inputParser;
+            addParameter(p,'colorMode','auto'); % timing; heatmap 
+            addParameter(p,'coeff',eye(3)); % eye(3) for axial; [1 0 0; 0 0 1; 0 1 0] for coronal; [0 0 1; 1 0 0; 0 1 0] for sagittal 
+            parse(p,varargin{:})
+            colorMode = p.Results.colorMode;
+            coeff = p.Results.coeff; 
+
+            %% Preamble
+
+            [~, myBp] = self.retrieveBraindata; 
+
+            currentVertices = self.sourceLocalizationResults.localizationResults(1,:);
+            locationsMaster = self.convertVerticesToLocations(myBp, currentVertices);
+
+            assert(~isempty(locationsMaster),'No localization for %s.',self.subj); 
+
+            %% Process dimension reduction.
+
+            score = locationsMaster * coeff;
+            % score = (locationsMaster - mu) * coeff;
+            [a,b,c] = unique(currentVertices,'stable');
+            score = score(b,:);
+
+            % The above should index into a, where each element is the number of
+            % appearances of a.
+
+            % We can sort by size so we plot largest first
+
+            % locsCounts = histcounts(categorical(c)); 
+            % [~,sortCount] = sort(locsCounts,'ascend');
+            % sortCount = randperm(size(score,1));
+            % sortCount = 1:size(score,1);
+            % sortCount = size(score,1):-1:1;
+            % score = score(sortCount,:);
+            % locsCounts = locsCounts(sortCount);
+            % countVals = normalizeToBounds(locsCounts,[8 100]);  % Scaling
+
+            inRange = squareform(pdist(locationsMaster));
+            currentRad = 2;
+            inRange = sum(inRange <= currentRad);
+            inRange = inRange(b); 
+
+            [inRange,sortCount] = sort(inRange,'descend'); 
+            score = score(sortCount,:);
+
+            % maxDensity = max(inRange) / (4/3 * pi * currentRad ^ 3);
+            maxDensity = max(inRange);
+            fprintf('Max density is %.2f.\n',maxDensity);
+
+            % countVals = normalizeToBounds(inRange,[15 50],[1 108]); warning('Scaling.');
+            countVals = normalizeToBounds(inRange,[15 50]);
+
+            if isequal(colorMode,'auto')
+                colorMode = 'heatmap';
+            end
+
+            switch colorMode
+
+                case 'heatmap'
+                    cmap = turbo;
+                    colorVals = round(normalizeToBounds(inRange,[1 size(cmap,1)]));
+                    colorVals = cmap(colorVals,:);
+
+                case 'timing'
+                    cmap = parula;
+
+                    colorVals = zeros(size(a));
+
+                    for jj = 1:length(a)
+                        colorVals(jj) = mean(self.sourceLocalizationResults.localizationResults(3,self.sourceLocalizationResults.localizationResults(1,:)==a(jj)));
+                    end
+                    colorVals = round(normalizeToBounds(colorVals,[1 size(cmap,1)]));
+                    colorVals = colorVals(sortCount);
+
+                    colorVals = cmap(colorVals,:);
+
+            end
+
+            %% Plot
+
+            % figure
+            cla; hold on
+
+            boundaryVert = [myBp.surfaces.pial_lh.vertices; myBp.surfaces.pial_rh.vertices];
+            boundaryVert = boundaryVert * coeff;
+            boundaryVert = boundaryVert(1:10:end,:);
+            boundaryVert = double(boundaryVert(:,[1 2]));
+            boundInds = boundary(boundaryVert(:,1),boundaryVert(:,2));
+            plot(boundaryVert(boundInds,1),boundaryVert(boundInds,2),'k-','linewidth',2);
+            
+            for ii = 1:size(score,1)
+                plot(score(ii,1),score(ii,2),'.', ...
+                    'color',colorVals(ii,:),...
+                    'MarkerSize',countVals(ii))
+            end
+
+            %% Formatting
+
+            [d1, d0] = self.coeffToOrientation(coeff);
+
+            axis equal
+            set(gca,'DataAspectRatio',[1 1 1])
+            % set(gca,'PlotBoxAspectRatio',[3 4 4])
+            box on
+
+            xticks(xlim); yticks(ylim);
+            % xticklabels([d0(1,1) d1(1,1)]);
+            % yticklabels([d0(2,1) d1(2,1)]);
+            xticklabels({sprintf('%s',d0{1,1}), sprintf('%s',d1{1,1})});
+            yticklabels({sprintf('%s',d0{2,1}), sprintf('%s',d1{2,1})});
+
+        end
+
+        function plotTimeSeries(self, varargin)
+            % Staggered multi-channel time series viewer with mini overview and drag scroll.
+            %
+            % Usage:
+            %   sl.plotTimeSeries()
+            %   sl.plotTimeSeries('winSec', 1800)     % 120-min window (default)
+            %   sl.plotTimeSeries('stagger', 1)       % z-score unit spacing (default)
+            %   sl.plotTimeSeries('spikePlottingMode', 'fromSeq')    % default: patches + dots from seqResults
+            %   sl.plotTimeSeries('spikePlottingMode', 'fromRaster') % red dots from spikeDetectionResults.rasters
+            %   sl.plotTimeSeries('spikePlottingMode', 'none')       % no spike overlay
+            %
+            % Navigation:
+            %   Drag the blue window on the mini overview to scroll
+            %   Left/Right arrow  — scroll 25% of window
+            %   PageUp/PageDown   — scroll one full window
+            %   Up/Down arrow     — scale amplitude up/down (stagger unchanged)
+            %   Scale +/− buttons — same as Up/Down arrow
+            %
+            % Spike overlay modes (spikePlottingMode):
+            %   'fromSeq'    — shaded patches + red dots from self.seqResults
+            %   'fromRaster' — red dots only, from self.spikeDetectionResults.rasters
+            %   'none'       — no overlay
+
+            ip = inputParser;
+            ip.addParameter('winSec',            120*60,     @isnumeric);
+            ip.addParameter('stagger',           1,         @isnumeric);
+            ip.addParameter('spikePlottingMode', 'fromSeq', ...
+                @(x) ischar(x) && ismember(x, {'fromSeq','fromRaster','none'}));
+            ip.addParameter('startDatetime',     [],        @(x) isempty(x) || isa(x,'datetime'));
+            ip.addParameter('comparisonResults', [],        @(x) isempty(x) || isstruct(x));
+            ip.addParameter('overlayBandpass',   false,     @islogical);
+            ip.addParameter('envWinSec',         2,         @isnumeric);
+            ip.parse(varargin{:});
+            winSec            = ip.Results.winSec;
+            stagger           = ip.Results.stagger;
+            spikePlottingMode = ip.Results.spikePlottingMode;
+            startDatetime     = ip.Results.startDatetime;
+            comparisonResults = ip.Results.comparisonResults;
+            overlayBandpass   = ip.Results.overlayBandpass;
+            envWinSec         = ip.Results.envWinSec;
+
+            assert(~isempty(self.timeSeries), '[plotTimeSeries] timeSeries is empty.');
+            assert(~isempty(self.Fs),         '[plotTimeSeries] Fs is not set.');
+
+            ts       = self.timeSeries;           % [samples x channels]
+            nSamp    = size(ts, 1);
+            nChan    = size(ts, 2);
+            t        = (1:nSamp)' / self.Fs / 60;  % minutes
+            totalSec = t(end);                        % now totalMin
+            winSec   = min(winSec / 60, totalSec);    % convert input (seconds) → minutes
+
+            % Z-score per channel
+            mu = mean(ts, 1, 'omitnan');
+            sd = std(ts,  0, 1, 'omitnan');
+            sd(sd == 0) = 1;
+            ts = (ts - mu) ./ sd;
+
+            % ── Bandpass overlay ────────────────────────────────────────────
+            % The 0.5-30 Hz overlay is plotted as a slow RMS *envelope*, not the
+            % raw oscillation: plotTimeSeries subsamples the display by dispDec,
+            % and subsampling a high-frequency signal aliases it into slow
+            % artifacts. The envelope is slow-varying, decimates cleanly, and
+            % directly shows the post-SD depression. Built below, after dispDec
+            % is known (computeBandpassEnvelope caches the result on the object).
+
+            % Valid time range — crop mini overview to first/last non-NaN sample
+            validMask  = any(~isnan(ts), 2);
+            validIdx   = find(validMask);
+            if isempty(validIdx)
+                tValid = [0, totalSec];
+            else
+                tValid = [t(validIdx(1)), t(validIdx(end))];
+            end
+
+            % Fixed stagger offsets (scale never changes these)
+            offsets = ((nChan-1):-1:0) * stagger;   % 1 x nChan
+
+            % Display decimation — cap main axes at 100,000 rendered points
+            MAX_DISP_SAMP = 500000;
+            dispDec = max(1, floor(nSamp / MAX_DISP_SAMP));
+            if dispDec > 1
+                fprintf('[plotTimeSeries] Display decimated %dx (%d → %d pts).\n', ...
+                    dispDec, nSamp, floor(nSamp/dispDec));
+            end
+            t_disp   = t(1:dispDec:end);
+            ts_base  = ts(1:dispDec:end, :);   % z-scored, decimated — no scale/stagger yet
+
+            % ── Bandpass overlay: build decimated envelope ──────────────────
+            % Compute (or fetch cached) 0.5-30 Hz RMS envelope at this dispDec,
+            % then z-score per channel so it shares the staggered layout. The
+            % envelope's own decimated time axis matches t_disp because it uses
+            % the same dispDec on rawTimeSeries (same sample grid as timeSeries).
+            if overlayBandpass
+                self.computeBandpassEnvelope(dispDec, envWinSec);   % cached if unchanged
+                tsBp_base = double(self.bpEnvelope);                 % [decSamp x nChan]
+
+                % z-score per channel (envelope is all-positive; centering puts
+                % the depression as a downward dip around each channel baseline)
+                muBp = mean(tsBp_base, 1, 'omitnan');
+                sdBp = std(tsBp_base,  0, 1, 'omitnan');
+                sdBp(sdBp == 0) = 1;
+                tsBp_base = (tsBp_base - muBp) ./ sdBp;
+
+                % Align lengths with t_disp (guard against off-by-one from decimation)
+                nCommon   = min(size(tsBp_base,1), numel(t_disp));
+                tsBp_base = tsBp_base(1:nCommon, :);
+                t_dispBp  = t_disp(1:nCommon);
+            else
+                tsBp_base = [];
+                t_dispBp  = [];
+            end
+
+            scale = 1;   % mutable amplitude scale; stagger is always offsets
+
+            % Channel names
+            if isempty(self.chanNames) || numel(self.chanNames) ~= nChan
+                cNames = arrayfun(@(k) sprintf('Ch%d',k), 1:nChan, 'UniformOutput', false);
+            else
+                cNames = self.chanNames(:)';
+            end
+            [tickVals, tickIdx] = sort(offsets);
+            tickLabels = cNames(tickIdx);
+
+            % ── Spike overlay data ──────────────────────────────────────────
+            % Pre-compute patch times and dot positions (scale-dependent y computed
+            % at draw time and updated on changeScale).
+            seqPatchTimes = zeros(0,2);   % [nSeq x 2] start/end in minutes
+            dotTimes      = zeros(1,0);   % x positions (minutes)
+            dotSigBase    = zeros(1,0);   % z-scored signal value at dot (no scale, no offset)
+            dotOffsets    = zeros(1,0);   % channel stagger offset for each dot
+            dotColors     = zeros(0,3);   % per-dot RGB (empty => fall back to default red)
+
+            switch spikePlottingMode
+                case 'fromSeq'
+                    hasSeq = isfield(self.seqResults,'startEndTime') && ...
+                             ~isempty(self.seqResults.startEndTime);
+                    if hasSeq
+                        SET   = self.seqResults.startEndTime;   % 2 x nSeq  (samples)
+                        sAll  = self.seqResults.seriesAll;       % maxLen x nSeq
+                        tAll  = self.seqResults.timesAll;        % maxLen x nSeq  (samples, first abs + diffs)
+                        nSeq  = size(SET, 2);
+
+                        seqPatchTimes = SET' / self.Fs / 60;    % nSeq x 2, minutes
+
+                        for jj = 1:nSeq
+                            col = sAll(:, jj);
+                            col = col(~cellfun(@isempty, col));
+                            nContacts = numel(col);
+                            if nContacts == 0, continue; end
+
+                            % Reconstruct absolute sample times (first entry is absolute,
+                            % remaining are diffs)
+                            absSamples = cumsum(tAll(1:nContacts, jj));
+
+                            for kk = 1:nContacts
+                                chanIdx = find(strcmp(cNames, col{kk}), 1);
+                                if isempty(chanIdx), continue; end
+
+                                tMin = absSamples(kk) / self.Fs / 60;
+                                [~, dispIdx] = min(abs(t_disp - tMin));
+
+                                dotTimes(end+1)   = t_disp(dispIdx);
+                                dotSigBase(end+1) = ts_base(dispIdx, chanIdx);
+                                dotOffsets(end+1) = offsets(chanIdx);
+                            end
+                        end
+                    end
+
+                case 'fromRaster'
+                    if ~isempty(comparisonResults) && ...
+                            isfield(comparisonResults,'rasterDetected') && ...
+                            isfield(comparisonResults,'rasterAnnotated')
+                        rD = comparisonResults.rasterDetected;
+                        rA = comparisonResults.rasterAnnotated;
+                        if isfield(comparisonResults,'timeWindow') && ~isempty(comparisonResults.timeWindow)
+                            tW = comparisonResults.timeWindow;
+                        else
+                            tW = round(5 * 60 * self.Fs);   % default: 5 min
+                        end
+                        [iD, jD] = find(rD);  iD = iD(:);  jD = jD(:);
+                        [iA, jA] = find(rA);  iA = iA(:);  jA = jA(:);
+
+                        detMatched = false(numel(iD), 1);
+                        annMatched = false(numel(iA), 1);
+                        chans = unique([jD; jA]).';
+                        for ch = chans
+                            mD = jD == ch;  mA = jA == ch;
+                            iDch = iD(mD); iAch = iA(mA);
+                            if isempty(iDch) || isempty(iAch); continue; end
+                            diffs = abs(iDch - iAch.');     % nDch x nAch
+                            detMatched(mD) = any(diffs <= tW, 2);
+                            annMatched(mA) = any(diffs <= tW, 1).';
+                        end
+
+                        allI    = [iD; iA];
+                        allJ    = [jD; jA];
+                        matched = [detMatched; annMatched];
+                        isDet   = [true(numel(iD),1); false(numel(iA),1)];
+
+                        GREEN = [0    0.7  0   ];
+                        RED   = [0.85 0.2  0   ];
+                        BLUE  = [0.2  0.4  0.85];
+                        cMat  = zeros(numel(allI), 3);
+                        cMat(matched, :)             = repmat(GREEN, sum(matched), 1);
+                        cMat(~matched & isDet, :)    = repmat(RED,   sum(~matched & isDet),  1);
+                        cMat(~matched & ~isDet, :)   = repmat(BLUE,  sum(~matched & ~isDet), 1);
+
+                        if ~isempty(allI)
+                            dispIdxAll = max(1, min(round(allI / dispDec), numel(t_disp)));
+                            linIdx     = sub2ind(size(ts_base), dispIdxAll, allJ);
+                            dotTimes   = reshape(t_disp(dispIdxAll), 1, []);
+                            dotSigBase = reshape(ts_base(linIdx),    1, []);
+                            dotOffsets = reshape(offsets(allJ),      1, []);
+                            dotColors  = cMat;
+                        end
+                    else
+                        hasRaster = ~isempty(self.spikeDetectionResults) && ...
+                            isfield(self.spikeDetectionResults,'rasters') && ...
+                            ~isempty(self.spikeDetectionResults.rasters);
+                        if hasRaster
+                            R = self.spikeDetectionResults.rasters;
+                            [sampIdx, chanIdx] = find(R);
+                            if ~isempty(sampIdx)
+                                sampIdx = sampIdx(:);
+                                chanIdx = chanIdx(:);
+                                dispIdxAll = max(1, min(round(sampIdx / dispDec), numel(t_disp)));
+                                linIdx = sub2ind(size(ts_base), dispIdxAll, chanIdx);
+                                dotTimes   = reshape(t_disp(dispIdxAll), 1, []);
+                                dotSigBase = reshape(ts_base(linIdx),    1, []);
+                                dotOffsets = reshape(offsets(chanIdx),   1, []);
+                            end
+                        end
+                    end
+
+                case 'none'
+                    % no overlay
+            end
+
+            % ── Figure ──────────────────────────────────────────────────────
+            fig = figure('Name', sprintf('Time Series — %s', self.subj), ...
+                'NumberTitle','off', 'Color','w', ...
+                'WindowStyle','docked', ...
+                'KeyPressFcn',           @onKeyPress, ...
+                'WindowButtonDownFcn',   @onMouseDown, ...
+                'WindowButtonMotionFcn', @onMouseMove, ...
+                'WindowButtonUpFcn',     @onMouseUp, ...
+                'WindowScrollWheelFcn',  @onScroll);
+
+            % Main axes
+            axMain = axes('Parent', fig, ...
+                'Position', [0.09 0.26 0.89 0.71], ...
+                'Color','w', 'Box','off', 'TickDir','out', 'FontSize',11);
+            hold(axMain, 'on');
+
+            % Sequence shaded windows (drawn first so traces appear on top)
+            for jj = 1:size(seqPatchTimes, 1)
+                t0 = seqPatchTimes(jj,1);  t1 = seqPatchTimes(jj,2);
+                hp = patch(axMain, [t0 t1 t1 t0], [-1e4 -1e4 1e4 1e4], ...
+                    [1 0.55 0.1], 'FaceAlpha',0.15, 'EdgeColor','none', 'HitTest','off');
+                hp.YLimInclude = 'off';
+            end
+
+            hLines = plot(axMain, t_disp, ts_base * scale + offsets, ...
+                'Color',[0.15 0.35 0.65], 'LineWidth',0.6);
+
+            % ── Bandpass overlay: plot envelope ─────────────────────────────
+            % Orange trace = z-scored 0.5-30 Hz RMS envelope. Dips downward
+            % during post-SD depression. Uses t_dispBp (own length).
+            hLinesBp = [];
+            if overlayBandpass
+                hLinesBp = plot(axMain, t_dispBp, tsBp_base * scale + offsets, ...
+                    'Color', [0.85 0.35 0.10], 'LineWidth', 0.8);
+            end
+
+            % Sequence dots
+            hSeqDots = [];
+            if ~isempty(dotTimes)
+                if ~isempty(dotColors)
+                    cArg = dotColors;        % per-dot RGB
+                else
+                    cArg = [0.85 0.2 0];     % default red
+                end
+                hSeqDots = scatter(axMain, dotTimes, dotSigBase * scale + dotOffsets, ...
+                    40, cArg, 'filled', 'HitTest','off');
+            end
+
+            % Legend for comparison-mode coloring
+            if ~isempty(dotColors)
+                hG = scatter(axMain, NaN, NaN, 40, [0    0.7  0   ], 'filled', ...
+                    'DisplayName','Detected & Annotated');
+                hR = scatter(axMain, NaN, NaN, 40, [0.85 0.2  0   ], 'filled', ...
+                    'DisplayName','Detected only');
+                hB = scatter(axMain, NaN, NaN, 40, [0.2  0.4  0.85], 'filled', ...
+                    'DisplayName','Annotated only');
+                legend(axMain, [hG hR hB], 'Location','best', 'AutoUpdate','off');
+            end
+
+            set(axMain, 'YTick',tickVals, 'YTickLabel',tickLabels, 'XLim',[tValid(1), tValid(1)+winSec]);
+
+            % Mini overview axes
+            axMini = axes('Parent', fig, ...
+                'Position', [0.09 0.07 0.89 0.10], ...
+                'Color',[0.94 0.94 0.94], 'Box','off', ...
+                'YColor','none', 'FontSize',9);
+            hold(axMini, 'on');
+            miniDec = max(1, floor(nSamp / 3000));
+            plot(axMini, t(1:miniDec:end), ts(1:miniDec:end,:) + offsets, ...
+                'Color',[0.55 0.55 0.55], 'LineWidth',0.3);
+            xlim(axMini, tValid);
+            xlabel(axMini, 'Time (min)');
+
+            % Sequence stripes in mini overview
+            drawnow limitrate;
+            yl = ylim(axMini);
+            for jj = 1:size(seqPatchTimes, 1)
+                t0 = seqPatchTimes(jj,1);  t1 = seqPatchTimes(jj,2);
+                hp = patch(axMini, [t0 t1 t1 t0], [yl(1) yl(1) yl(2) yl(2)], ...
+                    [1 0.55 0.1], 'FaceAlpha',0.35, 'EdgeColor','none', 'HitTest','off');
+                hp.YLimInclude = 'off';
+            end
+
+            % Window indicator patch
+            hPatch = patch(axMini, ...
+                [tValid(1) tValid(1)+winSec tValid(1)+winSec tValid(1) tValid(1)], [yl(1) yl(1) yl(2) yl(2) yl(1)], ...
+                [0.20 0.45 0.85], 'FaceAlpha',0.25, ...
+                'EdgeColor',[0.20 0.45 0.85], 'LineWidth',1.2, 'HitTest','off');
+
+            % Scale buttons
+            uicontrol('Parent',fig, 'Style','pushbutton', 'String','Scale +', ...
+                'Units','normalized', 'Position',[0.09 0.01 0.07 0.04], ...
+                'FontSize',11, 'Callback',@(~,~) changeScale(1.5));
+            uicontrol('Parent',fig, 'Style','pushbutton', 'String','Scale −', ...
+                'Units','normalized', 'Position',[0.17 0.01 0.07 0.04], ...
+                'FontSize',11, 'Callback',@(~,~) changeScale(1/1.5));
+
+            % Drag state
+            isDragging   = false;
+            dragSource   = '';    % 'mini' or 'main'
+            dragStartX   = 0;
+            dragStartWin = 0;
+            hDateLabels  = gobjects(0);   % text objects for date row (datetime mode)
+
+            setWindow(0);   % initialise XLim + XTick
+
+            % ── Nested callbacks ────────────────────────────────────────────
+            function setWindow(tStart)
+                tStart = max(tValid(1), min(tStart, tValid(2) - winSec));
+                xlim(axMain, [tStart, tStart + winSec]);
+                yl2 = ylim(axMini);
+                hPatch.XData = [tStart tStart+winSec tStart+winSec tStart tStart];
+                hPatch.YData = [yl2(1) yl2(1) yl2(2) yl2(2) yl2(1)];
+                % Ticks every 15 minutes
+                tickStep = 15;   % minutes
+                ticks    = (ceil(tStart / tickStep) * tickStep) : tickStep : (tStart + winSec);
+                % Remove stale date label text objects
+                delete(hDateLabels(isvalid(hDateLabels)));
+                hDateLabels = gobjects(0);
+                if ~isempty(startDatetime)
+                    tickDt = startDatetime + minutes(ticks);
+                    % Time on the tick label row, date on a text row above
+                    set(axMain, 'XTick', ticks, ...
+                        'XTickLabel', arrayfun(@(dt) datestr(dt,'HH:MM'), tickDt, 'UniformOutput', false));
+                    hDateLabels = gobjects(1, numel(ticks));
+                    for k = 1:numel(ticks)
+                        xNorm = (ticks(k) - tStart) / winSec;
+                        hDateLabels(k) = text(axMain, xNorm, -0.06, ...
+                            datestr(tickDt(k), 'mm/dd/yy'), ...
+                            'Units', 'normalized', ...
+                            'HorizontalAlignment', 'center', ...
+                            'VerticalAlignment', 'top', ...
+                            'FontSize', get(axMain,'FontSize'), ...
+                            'Clipping', 'off');
+                    end
+                else
+                    set(axMain, 'XTick', ticks, ...
+                        'XTickLabel', arrayfun(@(x) sprintf('%g min', x), ticks, 'UniformOutput', false));
+                end
+            end
+
+            function changeScale(factor)
+                scale = scale * factor;
+                ts_new = ts_base * scale + offsets;
+                for k = 1:nChan
+                    hLines(k).YData = ts_new(:, k);
+                end
+                % ── Bandpass overlay: Stage 5 rescale — mirror of raw loop above ──
+                if ~isempty(hLinesBp) && all(isvalid(hLinesBp))
+                    tsBp_new = tsBp_base * scale + offsets;
+                    for k = 1:nChan
+                        hLinesBp(k).YData = tsBp_new(:, k);
+                    end
+                end
+                if ~isempty(hSeqDots) && isvalid(hSeqDots)
+                    hSeqDots.YData = dotSigBase * scale + dotOffsets;
+                end
+            end
+
+            function onMouseDown(~,~)
+                % Check mini axes first
+                pt  = get(axMini, 'CurrentPoint');
+                xl  = xlim(axMini);
+                yl2 = ylim(axMini);
+                if pt(1,1) >= xl(1) && pt(1,1) <= xl(2) && ...
+                   pt(1,2) >= yl2(1) && pt(1,2) <= yl2(2)
+                    setWindow(pt(1,1) - winSec/2);
+                    isDragging   = true;
+                    dragSource   = 'mini';
+                    dragStartX   = pt(1,1);
+                    dragStartWin = axMain.XLim(1);
+                    return;
+                end
+                % Check main axes
+                pt  = get(axMain, 'CurrentPoint');
+                xl  = xlim(axMain);
+                yl2 = ylim(axMain);
+                if pt(1,1) >= xl(1) && pt(1,1) <= xl(2) && ...
+                   pt(1,2) >= yl2(1) && pt(1,2) <= yl2(2)
+                    isDragging   = true;
+                    dragSource   = 'main';
+                    dragStartX   = pt(1,1);
+                    dragStartWin = axMain.XLim(1);
+                end
+            end
+
+            function onMouseMove(~,~)
+                if ~isDragging, return; end
+                if strcmp(dragSource, 'mini')
+                    pt = get(axMini, 'CurrentPoint');
+                    setWindow(dragStartWin + (pt(1,1) - dragStartX));
+                else
+                    pt = get(axMain, 'CurrentPoint');
+                    % Dragging right pulls content right → window moves left
+                    setWindow(dragStartWin - (pt(1,1) - dragStartX));
+                end
+            end
+
+            function onMouseUp(~,~)
+                isDragging = false;
+                dragSource = '';
+            end
+
+            function onScroll(~, evt)
+                tNow = axMain.XLim(1);
+                setWindow(tNow + winSec * 0.1 * evt.VerticalScrollCount);
+            end
+
+            function onKeyPress(~, evt)
+                tNow = axMain.XLim(1);
+                switch evt.Key
+                    case 'rightarrow', setWindow(tNow + winSec * 0.25);
+                    case 'leftarrow',  setWindow(tNow - winSec * 0.25);
+                    case 'pagedown',   setWindow(tNow + winSec);
+                    case 'pageup',     setWindow(tNow - winSec);
+                    case 'uparrow',    changeScale(1.5);
+                    case 'downarrow',  changeScale(1/1.5);
+                end
+            end
+
+        end
+
+        function downsampleTs(self, varargin)
+        % DOWNSAMPLETS  Downsample, artifact-reject, and baseline-correct timeSeries in-place.
+        %
+        % Usage:
+        %   sl.downsampleTs()
+        %   sl.downsampleTs('targetFs', 10, 'zThresh', 10, 'medFiltMin', 30)
+        %
+        % Steps (in order):
+        %   1. Linearly interpolate samples where |z-score| > zThresh (on full-res data)
+        %   2. Resample to targetFs (resample() applies anti-aliasing lowpass internally)
+        %   3. Subtract per-channel moving median to remove slow baseline drift
+        %
+        % Overwrites sl.timeSeries and updates sl.Fs.
+        %
+        % Parameters:
+        %   targetFs    - target sample rate in Hz              (default 1)
+        %   zThresh     - artifact z-score threshold            (default 10; [] = skip)
+        %   medFiltMin  - median filter window in minutes       (default 30; [] = skip)
+
+            p = inputParser;
+            addParameter(p, 'targetFs',   1);
+            addParameter(p, 'medFiltMin', 30);
+            parse(p, varargin{:});
+            targetFs   = p.Results.targetFs;
+            medFiltMin = p.Results.medFiltMin;
+
+            assert(~isempty(self.timeSeries), ...
+                '[downsampleTs] timeSeries is empty — load data first.');
+            assert(~isempty(self.Fs) && self.Fs > 0, ...
+                '[downsampleTs] Fs not set.');
+            assert(targetFs < self.Fs, ...
+                '[downsampleTs] targetFs (%.4g) must be less than current Fs (%.4g).', targetFs, self.Fs);
+
+            ts = double(self.timeSeries);
+            Fs = self.Fs;
+
+            % Downsample
+            [p_r, q_r] = rat(targetFs / Fs);
+            FsOld = Fs;
+            ts = resample(ts, p_r, q_r);
+            Fs = FsOld * p_r / q_r;
+            fprintf('[downsampleTs] Downsampled from %.4g Hz to %.4g Hz → %d samples.\n', ...
+                FsOld, Fs, size(ts, 1));
+
+            % Median filter baseline removal
+            if ~isempty(medFiltMin)
+                winSamp = 2*floor(medFiltMin * 60 * Fs / 2) + 1;  % must be odd
+                fprintf('[downsampleTs] Removing baseline with %.0f-min median filter.\n', medFiltMin);
+                for c = 1:size(ts,2)
+                    ts(:,c) = ts(:,c) - medfilt1(ts(:,c), winSamp);
+                end
+            end
+
+            self.timeSeries = ts;
+            self.Fs = Fs;
+        end
+
+        function filterTs(self, cutoffHz, varargin)
+        % FILTERTS  Lowpass filter timeSeries in-place.
+        %
+        % Usage:
+        %   sl.filterTs(cutoffHz)
+        %   sl.filterTs(cutoffHz, 'order', 4)
+        %
+        % Parameters:
+        %   cutoffHz  - passband upper bound in Hz (required)
+        %   order     - Butterworth filter order   (default 4)
+
+            p = inputParser;
+            addRequired(p,  'cutoffHz', @isnumeric);
+            addParameter(p, 'order', 4, @isnumeric);
+            parse(p, cutoffHz, varargin{:});
+            order = p.Results.order;
+
+            assert(~isempty(self.timeSeries), '[filterTs] timeSeries is empty.');
+            assert(~isempty(self.Fs) && self.Fs > 0, '[filterTs] Fs not set.');
+            assert(cutoffHz < self.Fs/2, ...
+                '[filterTs] cutoffHz (%.4g) must be below Nyquist (%.4g Hz).', cutoffHz, self.Fs/2);
+
+            filt = designfilt('lowpassiir', ...
+                'FilterOrder',        order, ...
+                'HalfPowerFrequency', cutoffHz, ...
+                'SampleRate',         self.Fs);
+
+            ts = double(self.timeSeries);
+            for c = 1:size(ts, 2)
+                valid = ~isnan(ts(:, c));
+                if sum(valid) > order * 3
+                    ts(valid, c) = filtfilt(filt, ts(valid, c));
+                end
+            end
+
+            self.timeSeries = ts;
+            fprintf('[filterTs] Lowpass filtered at %.4g Hz (order %d).\n', cutoffHz, order);
+        end
+
+        function detrendTs(self, varargin)
+        % DETRENDTS  Remove slow trends from timeSeries in-place.
+        %
+        % Subtracts a per-channel moving average computed over a window
+        % long enough that SD-scale events (~1-10 min) are preserved while
+        % slower drift (>= ~15 min) is removed.
+        %
+        % Usage:
+        %   sl.detrendTs()
+        %   sl.detrendTs('windowMin', 15)
+        %
+        % Parameters:
+        %   windowMin - moving-average window in minutes (default 15)
+
+            p = inputParser;
+            addParameter(p, 'windowMin', 15, @(x) isnumeric(x) && x > 0);
+            parse(p, varargin{:});
+            windowMin = p.Results.windowMin;
+
+            assert(~isempty(self.timeSeries),         '[detrendTs] timeSeries is empty.');
+            assert(~isempty(self.Fs) && self.Fs > 0,  '[detrendTs] Fs not set.');
+
+            winSamps = max(1, round(windowMin * 60 * self.Fs));
+            ts = double(self.timeSeries);
+            ts = ts - smoothdata(ts, 1, 'movmean', winSamps, 'omitnan');
+            self.timeSeries = ts;
+
+            fprintf('[detrendTs] Subtracted %g-min moving average (%d samples).\n', ...
+                windowMin, winSamps);
+        end
+
+        function zeroArtifactWindows(self)
+        % ZEROARTIFACTWINDOWS  Detect artifact sample windows on raw
+        % timeSeries and replace them with linear interpolation in place.
+        %
+        % Per-channel: find narrow local minima (sharp transient deflections);
+        % flag any narrow peak that has at least one other narrow peak (any
+        % channel) within +/-100 ms; mark the union of +/-killWinSec windows
+        % around every partnered narrow peak as "bad". Then linearly
+        % interpolate self.timeSeries across each contiguous bad run so the
+        % signal stays continuous through the downstream filter (zero-fill
+        % would create step discontinuities that ring).
+        %
+        % Stores the bad-sample mask in self.spikeDetectionResults.artifactMask
+        % (logical, length nSamp) for inspection — but no later application
+        % step is required: the interpolation flattens the artifact at the
+        % source, so detected spike samples landing in flagged windows are
+        % already squashed.
+        %
+        % Intended to run on RAW (unfiltered) timeSeries — call this BEFORE
+        % filtering/detrending so transient artifacts are detected in their
+        % native form (filtering would shift / smear the negative peaks and
+        % leak them out of any post-hoc mask).
+
+            assert(~isempty(self.timeSeries), ...
+                '[zeroArtifactWindows] timeSeries empty.');
+
+            Fs              = self.Fs;
+            ts              = self.timeSeries;
+            [nSamp, nChan]  = size(ts);
+            maxNarrowWidth  = max(1, round(30 * Fs));   % 30 s
+            zThreshNarrow   = 1;                        % sigma (per-channel)
+
+            % Cast a wide net: any narrow local minimum >= 1 sigma is
+            % a candidate. Two channels coinciding within 100 ms is
+            % overwhelmingly unlikely for real, independent SDs, so the
+            % co-firing filter (below) does the actual gatekeeping.
+            artifactRaster = sparse(nSamp, nChan);
+
+            warning('off','signal:findpeaks:largeMinPeakHeight');
+            for kk = 1:nChan
+                x  = ts(:, kk);
+                sd = std(x, 'omitnan');
+                if sd == 0 || ~isfinite(sd); continue; end
+                xZ = (x - mean(x, 'omitnan')) / sd;
+                [~, nIdx] = findpeaks(-xZ, ...
+                    'MinPeakHeight', zThreshNarrow, ...
+                    'MaxPeakWidth',  maxNarrowWidth);
+                if ~isempty(nIdx)
+                    artifactRaster(nIdx, kk) = true;
+                end
+            end
+
+            % Per-sample multiplicity of narrow peaks (summed across channels)
+            spikePerSample = full(sum(artifactRaster, 2));
+
+            % A narrow peak is "partnered" if there's at least one other
+            % narrow peak (any channel) within +/-100 ms. Box-conv counts all
+            % narrow peaks in the window (own contribution included), so
+            % >=2 means a partner exists.
+            partnerWinSamps = round(0.1 * Fs);
+            partnerBox      = ones(2 * partnerWinSamps + 1, 1);
+            nearbyCount     = conv(spikePerSample, partnerBox, 'same');
+            hasPartner      = (spikePerSample > 0) & (nearbyCount >= 2);
+
+            if ~any(hasPartner)
+                self.spikeDetectionResults.artifactMask = false(nSamp, 1);
+                fprintf('[zeroArtifactWindows] No partnered narrow peaks found; nothing zeroed.\n');
+                return
+            end
+
+            % Mask: union of +/-killWinSec windows around every partnered
+            % narrow peak. Wider than the partner-detection window because
+            % the artifact's slow tails bleed past the sharp tip — a narrow
+            % notch leaves the surrounding wings intact and the filter
+            % later reconstitutes a near-identical artifact.
+            killWinSec   = 10;
+            killWinSamps = round(killWinSec * Fs);
+            killBox      = ones(2 * killWinSamps + 1, 1);
+            artifactMask = conv(double(hasPartner), killBox, 'same') > 0;
+            artifactMask = artifactMask(:);
+            self.spikeDetectionResults.artifactMask = artifactMask;
+
+            % Linearly interpolate across each contiguous bad region so the
+            % signal stays continuous (zero-fill creates step discontinuities
+            % that ring through the downstream filter).
+            d         = diff([false; artifactMask; false]);
+            runStarts = find(d ==  1);
+            runEnds   = find(d == -1) - 1;
+            ts        = self.timeSeries;
+            for ii = 1:numel(runStarts)
+                s = runStarts(ii);
+                e = runEnds(ii);
+                n = e - s + 1;
+                hasLeft  = s > 1;
+                hasRight = e < nSamp;
+                if hasLeft && hasRight
+                    vL = ts(s - 1, :);   vR = ts(e + 1, :);
+                    w  = (1:n).' / (n + 1);          % n x 1
+                    ts(s:e, :) = vL + w .* (vR - vL); % n x nChan
+                elseif hasLeft         % run runs to end of signal — hold last good value
+                    ts(s:e, :) = repmat(ts(s - 1, :), n, 1);
+                elseif hasRight        % run starts at first sample — hold first good value
+                    ts(s:e, :) = repmat(ts(e + 1, :), n, 1);
+                else                    % whole signal is bad — give up and zero
+                    ts(s:e, :) = 0;
+                end
+            end
+            self.timeSeries = ts;
+
+            fprintf(['[zeroArtifactWindows] %d partnered narrow peaks; ' ...
+                '%d samples (%.2f%% of recording) interpolated across ' ...
+                '%d bad runs (+/-%g s kill window).\n'], ...
+                nnz(hasPartner), nnz(artifactMask), ...
+                100 * nnz(artifactMask) / nSamp, ...
+                numel(runStarts), killWinSec);
+        end
+
+    end
+
+    methods (Static = true)
+
+        function [spkLeads,spkTimes,startEndTime] = removeDuplicates(spkLeads,spkTimes,startEndTime)
+
+            seriesMap = containers.Map('keyType','char','valueType','any');
+            for jj = 1:size(spkTimes,2)
+
+                currentTimes = spkTimes(:,jj);
+                currentTimes(isnan(currentTimes)) = [];
+                for ii = 2:length(currentTimes)
+                    currentTimes(ii) = sum(currentTimes(ii - 1:ii));
+                end
+                currentLeads = spkLeads(:,jj);
+
+                % foundKey = false;
+                for ii = 1:length(currentTimes)
+                    currentKey = sprintf('%s_%d',currentLeads{ii},currentTimes(ii));
+
+                    if isKey(seriesMap,currentKey)
+                        seriesStruct = seriesMap(currentKey);
+                        % foundKey = true;
+                    else
+                        seriesStruct = struct;
+                        seriesStruct.indices = zeros(1,0);
+                        seriesStruct.length = zeros(1,0);
+                    end
+
+                    seriesStruct.indices(end + 1) = jj;
+                    seriesStruct.length(end + 1) = length(currentTimes);
+
+                    seriesMap(currentKey) = seriesStruct;
+                end
+
+            end
+            fullKeys = seriesMap.keys;
+
+            removeIndices = zeros(1,0);
+            for ii = 1:length(fullKeys)
+
+                seriesStruct = seriesMap(fullKeys{ii});
+                if isscalar(seriesStruct.indices); continue; end
+                [~,ind] = max(seriesStruct.length);
+
+                badIndices = seriesStruct.indices(1:length(seriesStruct.indices) ~= ind);
+                removeIndices = [removeIndices badIndices];
+
+            end
+            removeIndices = unique(removeIndices);
+            fprintf('%.2f%% of series removed as duplicates.\n',length(removeIndices) / size(spkLeads,2) * 100);
+            spkLeads(:,removeIndices) = [];
+            spkTimes(:,removeIndices) = [];
+            startEndTime(:,removeIndices) = [];
+            % overallInds(removeIndices) = [];
+
+            % warning('Remove duplicates done. Placing this warning so if we see it multiple times, we know this function is being called redundantly.');
+
+        end
+
+        function vert = convertLocationsToVertices(myBp,locations)
+
+            vertL = myBp.surfaces.pial_lh.vertices;
+            vertR = myBp.surfaces.pial_rh.vertices;
+
+            stdVert = myBp.stdNumVert;
+
+            vertAll = [vertL;vertR];
+
+            [~,vert] = min(pdist2(vertAll,locations));
+
+            isLeft = vert <= stdVert;
+            vert(isLeft) = vert(isLeft) * -1;
+            vert(~isLeft) = vert(~isLeft) - stdVert;
+
+        end
+        
+        function locations = convertVerticesToLocations(myBp,vertices)
+
+            % Negative numbers in vertices should indicate left hemisphere.
+            % Vertices are bounded between 1 and 198812, the number of
+            % vertices on a standard pial surface. 
+
+            %% Preamble
+
+            lVertices = myBp.surfaces.pial_lh.vertices;
+            rVertices = myBp.surfaces.pial_rh.vertices;
+
+            %% Let's distribute our data into a master map.
+
+            locations = nan(length(vertices),3); 
+
+            for ii = 1:length(vertices)
+                isLeft = sign(vertices(ii)) == -1;
+                if isLeft; currentVert = lVertices;
+                else; currentVert = rVertices;
+                end
+
+                if isnan(vertices(ii)); continue; end
+
+                locations(ii,:) = currentVert(abs(vertices(ii)),:);
+            end
+
+        end
+
+        function [d1, d0] = coeffToOrientation(coeff)
+
+            % Orientation is RAS
+            oPos = {'Right','Anterior','Superior'};
+            oNeg = {'Left','Posterior','Inferior'};
+            d1 = cell(3,3);
+            d0 = d1;
+
+            if size(coeff,2) < 3
+                coeffTemp = zeros(3);
+                coeffTemp(:,1:size(coeff,2)) = coeff;
+                coeff = coeffTemp;
+            end
+
+            orientationPC = eye(3) * coeff';
+
+            for ii = 1:3
+                [~,inds] = sort(abs(orientationPC(ii,:)),'descend');
+
+                posInds = sign(orientationPC(ii,inds)) == 1;
+
+                d1(ii, posInds) = oPos(inds(posInds));
+                d1(ii, ~posInds) = oNeg(inds(~posInds));
+
+                d0(ii, posInds) = oNeg(inds(posInds));
+                d0(ii, ~posInds) = oPos(inds(~posInds));
+
+            end
+
+            % Each ROW of d provides the biggest, medium, and smallest influence of the
+            % initial dimensions, into that row.
+
+        end
+
+    end
+
+    methods (Static)
+
+        function ensureFieldTrip()
+            % Ensure FieldTrip is on the MATLAB path, auto-detecting the
+            % installation if needed. Checks in order:
+            %   1. ft_read_header already on path → already configured.
+            %   2. ft_defaults on path → call it to finish setup.
+            %   3. FIELDTRIP_HOME environment variable.
+            %   4. Common install parent directories, scanning for
+            %      subdirectories matching 'fieldtrip*' (handles versioned
+            %      installs like fieldtrip-20260218); latest version wins.
+
+            if exist('ft_read_header', 'file') == 2
+                return;
+            end
+
+            if exist('ft_defaults', 'file') == 2
+                addpath(fileparts(which('ft_defaults')));
+                addpath(fullfile(fileparts(which('ft_defaults')), 'utilities'));
+                ft_defaults;
+                return;
+            end
+
+            home = char(java.lang.System.getProperty('user.home'));
+
+            parentDirs = {
+                getenv('FIELDTRIP_HOME');
+                fullfile(home, 'Documents', 'MATLAB');
+                fullfile(home, 'MATLAB');
+                fullfile(home, 'fieldtrip');
+                '/usr/local';
+            };
+
+            for i = 1:numel(parentDirs)
+                parent = parentDirs{i};
+                if isempty(parent) || exist(parent, 'dir') ~= 7
+                    continue;
+                end
+
+                % Parent itself might be the FieldTrip root
+                if exist(fullfile(parent, 'ft_defaults.m'), 'file') == 2
+                    addpath(parent);
+                    addpath(fullfile(parent, 'utilities'));
+                    ft_defaults;
+                    return;
+                end
+
+                % Scan for fieldtrip* subdirectories; sort descending so
+                % latest version wins
+                d = dir(fullfile(parent, 'fieldtrip*'));
+                d = d([d.isdir]);
+                if isempty(d), continue; end
+                names = fliplr(sort({d.name}));
+                for j = 1:numel(names)
+                    candidate = fullfile(parent, names{j});
+                    if exist(fullfile(candidate, 'ft_defaults.m'), 'file') == 2
+                        addpath(candidate);
+                        addpath(fullfile(candidate, 'utilities'));
+                        ft_defaults;
+                        return;
+                    end
+                end
+            end
+
+            error(['[sourceLocalizerModified] FieldTrip not found. Install from ' ...
+                   'fieldtriptoolbox.org and either add it to your MATLAB ' ...
+                   'path or set the FIELDTRIP_HOME environment variable.']);
+        end
+
+        function chanNames = loadChanNamesFromFile()
+            % Prompt the user to select a file containing channel names.
+            % Returns a column cell array of strings, or {} if dismissed.
+            %
+            % Supported formats:
+            %   .mat — loads a variable containing a cell array of strings.
+            %   .csv — looks for a column named name/chanName/label/channel/
+            %          electrode (case-insensitive); falls back to first column
+            %          for headerless files. Compatible with BIDS electrodes.tsv
+            %          (rename .tsv to .csv or use the 'name' column directly).
+            %   .fif — reads header only via FieldTrip ft_read_header;
+            %          accepts both head-only files (e.g. *-head.fif) and
+            %          full data files. Requires FieldTrip on the path.
+            %   .edf — reads header only via edfinfo (R2023a+); no data loaded.
+
+            chanNames = {};
+
+            while true
+                choice = dlgNonModal( ...
+                    {'Channel names populate the electrode naming GUI so you can assign each detected contact to a named channel. You can also type names manually in the GUI if you prefer.', ...
+                     '', ...
+                     'Accepted formats:', ...
+                     '  .mat  — MATLAB workspace containing a cell array of strings', ...
+                     '  .csv  — name/chanName/label column, or first column if no header', ...
+                     '  .fif  — MNE/FieldTrip file; channel names read from header', ...
+                     '  .edf  — EDF/EDF+ file; channel names read from header only'}, ...
+                    'Channel Names', ...
+                    'Browse...', 'Skip');
+
+                if isempty(choice) || strcmp(choice, 'Skip')
+                    return;
+                end
+
+                [fname, fpath] = uigetfile( ...
+                    {'*.mat;*.csv;*.fif;*.edf', 'Channel names file (*.mat, *.csv, *.fif, *.edf)'}, ...
+                    'Select channel names file');
+
+                if ~isequal(fname, 0), break; end
+                % file picker cancelled — loop back to description dialog
+            end
+
+            fullPath = fullfile(fpath, fname);
+            [~, ~, ext] = fileparts(fname);
+
+            if strcmpi(ext, '.mat')
+                S = load(fullPath);
+                fields = fieldnames(S);
+                if isscalar(fields)
+                    chanNames = S.(fields{1});
+                else
+                    [idx, ok] = listdlg( ...
+                        'ListString',   fields, ...
+                        'SelectionMode','single', ...
+                        'PromptString', 'Select variable containing channel names:');
+                    if ok
+                        chanNames = S.(fields{idx});
+                    else
+                        fprintf('No variable selected. chanNames will be empty.\n');
+                        return;
+                    end
+                end
+
+            elseif strcmpi(ext, '.csv')
+                % Try to find a named column first (handles BIDS and similar
+                % formats where the column is called 'name', 'label', etc.).
+                T = readtable(fullPath, 'ReadVariableNames', true);
+                knownCols = {'channame','channames','name','names', ...
+                             'channel','channels','channel_name','channel_names', ...
+                             'label','labels','electrode','electrodes'};
+                colMatch = find(ismember(lower(T.Properties.VariableNames), knownCols), 1);
+                if ~isempty(colMatch)
+                    chanNames = T{:, colMatch};
+                else
+                    % No recognised header — treat as headerless, take col 1.
+                    T = readtable(fullPath, 'ReadVariableNames', false);
+                    chanNames = T{:, 1};
+                end
+
+            elseif strcmpi(ext, '.fif')
+                sourceLocalizerModified.ensureFieldTrip();
+                hdr       = ft_read_header(fullPath);
+                chanNames = hdr.label;
+
+            elseif strcmpi(ext, '.edf')
+                info      = edfinfo(fullPath);
+                chanNames = cellstr(info.SignalLabels);
+
+            else
+                error('Unsupported file type: %s. Use .mat, .csv, .fif, or .edf.', ext);
+            end
+
+            % Normalise to column cell array of char
+            if isstring(chanNames)
+                chanNames = cellstr(chanNames);
+            elseif isnumeric(chanNames)
+                chanNames = arrayfun(@num2str, chanNames, 'UniformOutput', false);
+            end
+            if ~iscell(chanNames)
+                chanNames = cellstr(chanNames);
+            end
+            chanNames = chanNames(:);
+        end
+
+        function [timeSeries, Fs, chanNames] = loadTimeSeriesFromFile(selectedChannels)
+            % Prompt the user to select a time series file and return its
+            % contents. Returns empty arrays if the dialog is dismissed.
+            %
+            % selectedChannels — optional cell array of channel names to load.
+            %   For EDF files, only those signals are read from disk (faster).
+            %   Pass {} or omit to load all channels.
+            %
+            % Returns:
+            %   timeSeries  [samples x channels] double
+            %   Fs          scalar sampling frequency (Hz)
+            %   chanNames   m x 1 cell array of channel name strings
+            %               (empty cell if the file provides none)
+            if nargin < 1, selectedChannels = {}; end
+
+            timeSeries = [];
+            Fs         = [];
+            chanNames  = {};
+
+            while true
+                choice = dlgNonModal( ...
+                    {'Select a time series file.', ...
+                     '', ...
+                     'Accepted formats:', ...
+                     '  .mat  — MATLAB workspace with a [samples x channels] matrix', ...
+                     '  .edf  — European Data Format', ...
+                     '  .fif  — MNE/FieldTrip file'}, ...
+                    'Load Time Series', 'Browse...', 'Cancel');
+                if isempty(choice) || strcmp(choice, 'Cancel')
+                    return;
+                end
+                [fname, fpath] = uigetfile( ...
+                    {'*.mat;*.edf;*.fif', 'Time series files (*.mat, *.edf, *.fif)'; ...
+                     '*.mat',             'MATLAB file (*.mat)'; ...
+                     '*.edf',             'European Data Format (*.edf)'; ...
+                     '*.fif',             'MNE FIF file (*.fif)'}, ...
+                    'Select time series file');
+                if ~isequal(fname, 0), break; end
+                % cancelled file picker — loop back to description dialog
+            end
+
+            fullPath = fullfile(fpath, fname);
+            [~, ~, ext] = fileparts(fname);
+
+            switch lower(ext)
+                case '.mat'
+                    [timeSeries, Fs, chanNames] = sourceLocalizerModified.loadTsFromMat(fullPath);
+                case '.edf'
+                    [timeSeries, Fs, chanNames] = sourceLocalizerModified.loadTsFromEdf(fullPath, selectedChannels);
+                case '.fif'
+                    [timeSeries, Fs, chanNames] = sourceLocalizerModified.loadTsFromFif(fullPath);
+                otherwise
+                    error('[sourceLocalizerModified] Unsupported format: %s. Use .mat, .edf, or .fif.', ext);
+            end
+        end
+
+
+        function [ts, Fs, chanNames] = loadTsFromMat(fullPath)
+            % Load time series from a .mat file.
+            % Searches for a 2-D numeric matrix and a scalar Fs variable.
+
+            S      = load(fullPath);
+            fnames = fieldnames(S);
+
+            % Find 2-D numeric matrix candidates
+            is2d  = cellfun(@(f) isnumeric(S.(f)) && ismatrix(S.(f)) && ~isscalar(S.(f)), fnames);
+            candidates = fnames(is2d);
+
+            if isempty(candidates)
+                error('[sourceLocalizerModified] No 2-D numeric matrix found in %s.', fullPath);
+            elseif isscalar(candidates)
+                tsVar = candidates{1};
+            else
+                [idx, ok] = listdlg( ...
+                    'ListString',   candidates, ...
+                    'SelectionMode','single', ...
+                    'PromptString', 'Select variable containing time series [samples x channels]:');
+                if ~ok
+                    ts = []; Fs = []; chanNames = {};
+                    return;
+                end
+                tsVar = candidates{idx};
+            end
+
+            ts = double(S.(tsVar));
+
+            % Locate Fs
+            fsFields = {'Fs','fs','srate','SampleRate','sample_rate','samplingRate','Srate'};
+            Fs = [];
+            for i = 1:numel(fsFields)
+                if isfield(S, fsFields{i}) && isscalar(S.(fsFields{i}))
+                    Fs = double(S.(fsFields{i}));
+                    break;
+                end
+            end
+            if isempty(Fs)
+                answer = inputdlg('Sampling frequency (Hz):', 'Enter Fs', 1, {'1000'});
+                if isempty(answer)
+                    error('[sourceLocalizerModified] Sampling frequency is required.');
+                end
+                Fs = str2double(answer{1});
+            end
+
+            % Locate channel names
+            cnFields = {'chanNames','chan_names','chans','labels','channel_names','channels','label'};
+            chanNames = {};
+            for i = 1:numel(cnFields)
+                if isfield(S, cnFields{i})
+                    v = S.(cnFields{i});
+                    if iscell(v) || isstring(v)
+                        chanNames = cellstr(v(:));
+                        break;
+                    end
+                end
+            end
+        end
+
+        function [ts, Fs, chanNames] = loadTsFromEdf(fullPath, selectedChannels)
+            % Load time series from an EDF file.
+            % Requires MATLAB R2020b+ Signal Processing Toolbox (edfread/edfinfo).
+            %
+            % selectedChannels — optional cell array of signal label strings.
+            %   When provided, only those channels are read from disk via
+            %   edfread 'SelectedSignals', which is significantly faster for
+            %   large EDF files with many unused channels.
+            if nargin < 2, selectedChannels = {}; end
+
+            assert(exist('edfread', 'file') == 2, ...
+                ['edfread not found. EDF import requires MATLAB R2020b+ with the ' ...
+                 'Signal Processing Toolbox.']);
+
+            % Use edfinfo for metadata — returns a stable struct across versions
+            info         = edfinfo(fullPath);
+            Fs           = double(info.NumSamples(1)) / seconds(info.DataRecordDuration);
+            allChanNames = cellstr(info.SignalLabels);
+
+            % Resolve which channels to load
+            if ~isempty(selectedChannels)
+                [mask, ~] = ismember(strtrim(selectedChannels), strtrim(allChanNames));
+                if ~all(mask)
+                    missing = selectedChannels(~mask);
+                    warning('[loadTsFromEdf] %d requested channel(s) not found in EDF: %s', ...
+                        sum(~mask), strjoin(missing, ', '));
+                end
+                toLoad    = selectedChannels(mask);
+                chanNames = toLoad(:);
+                fprintf('[loadTsFromEdf] Loading %d of %d channels from EDF (subset via chanNames).\n', ...
+                    numel(toLoad), numel(allChanNames));
+            else
+                toLoad    = {};
+                chanNames = allChanNames;
+            end
+
+            % Use edfread for data — API varies by MATLAB version
+            try
+                % R2021b+: 'OutputFormat','array' returns [nSamples x nChan] double
+                if ~isempty(toLoad)
+                    data = edfread(fullPath, 'SelectedSignals', toLoad, 'OutputFormat', 'array');
+                else
+                    data = edfread(fullPath, 'OutputFormat', 'array');
+                end
+                ts = double(data);
+            catch
+                % R2020b fallback: returns timetable with one cell per record per channel
+                if ~isempty(toLoad)
+                    tbl = edfread(fullPath, 'SelectedSignals', toLoad);
+                else
+                    tbl = edfread(fullPath);
+                end
+                nChan = width(tbl);
+                cols  = cell(1, nChan);
+                for c = 1:nChan
+                    cols{c} = vertcat(tbl{:, c}{:});
+                end
+                ts = double(horzcat(cols{:}));
+            end
+        end
+
+        function [ts, Fs, chanNames] = loadTsFromFif(fullPath)
+            % Load time series from an MNE FIF file.
+            % Requires FieldTrip (ft_read_header / ft_read_data) on path.
+
+            sourceLocalizerModified.ensureFieldTrip();
+
+            hdr = ft_read_header(fullPath);
+            dat = ft_read_data(fullPath, 'header', hdr);  % [channels x samples]
+
+            ts        = dat';                % [samples x channels]
+            Fs        = hdr.Fs;
+            chanNames = hdr.label(:);        % column cell array
+        end
+
+    end
+
+end
